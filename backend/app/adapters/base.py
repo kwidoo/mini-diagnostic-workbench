@@ -9,7 +9,16 @@ answer to the next request. Such a connection is therefore marked
 *unsynchronised* and is never reused. The next send first discards it
 (``_resync``), opens a fresh one, and vehicle requests are refused with
 :class:`TransportUnsyncedError` until the client has re-initialised the adapter
-on the new connection (:meth:`Transport.mark_initialized`).
+on the new connection.
+
+Initialisation rule (see ``ObdClient.initialize``): adapter setup runs through an
+:class:`InitAttempt` obtained from :meth:`Transport.begin_initialization`. An
+attempt is pinned to ONE fresh connection generation; it never reconnects or
+resynchronises. If any of its exchanges is incomplete, or the connection changes
+underneath it, every further step of that attempt is refused and the attempt can
+never be completed - the next attempt starts again with ATZ on a new connection.
+Ordinary vehicle requests (:meth:`Transport.send`) are refused unless the current
+generation was explicitly completed by an attempt; ``None`` never qualifies.
 """
 
 from __future__ import annotations
@@ -71,6 +80,25 @@ class TransportUnsyncedError(TransportError):
 
 INCOMPLETE = ("timeout", "cancelled", "closed", "desync")
 
+# the only vehicle request an initialisation attempt may send: the generic bus-up probe
+BOOTSTRAP_REQUEST = "0100"
+
+
+class InitAttempt:
+    """Private initialisation path: AT commands + the single 0100 bootstrap probe,
+    all on the one connection generation the attempt was started on."""
+
+    def __init__(self, transport: Transport, generation: int) -> None:
+        self._transport = transport
+        self.generation = generation
+
+    def send(self, cmd: AllowedCommand, timeout_s: float | None = None) -> Exchange:
+        return self._transport._send_init(self, cmd, timeout_s)
+
+    def complete(self) -> None:
+        """Declare the adapter initialised on this generation (vehicle requests allowed)."""
+        self._transport._complete_init(self)
+
 
 class Transport(ABC):
     kind = "abstract"
@@ -88,8 +116,12 @@ class Transport(ABC):
         self._last_end: float | None = None
         self._seq = 0
         self.synced = True  # False after any incomplete exchange: connection must not be reused
-        self.initialized_generation: int | None = None  # generation the client last initialised on
+        self.initialized_generation: int | None = None  # generation a completed InitAttempt ran on
         self.resyncs = 0
+        self.init_state = "none"  # none | initializing | initialized | failed
+        self.init_failures = 0
+        self._attempt: InitAttempt | None = None  # the only attempt allowed to send/complete
+        self._tainted_generation: int | None = None  # connection that lost sync (must be discarded)
 
     # -- lifecycle ----------------------------------------------------------
     @abstractmethod
@@ -109,6 +141,8 @@ class Transport(ABC):
             "last_error": self.last_error,
             "synced": self.synced,
             "resyncs": self.resyncs,
+            "init_state": self.init_state,
+            "init_failures": self.init_failures,
         }
 
     # -- synchronisation --------------------------------------------------------
@@ -116,12 +150,32 @@ class Transport(ABC):
         """Mark the current connection unusable (e.g. adapter init saw an unexpected reply)."""
         with self._lock:
             self.synced = False
+            self._tainted_generation = self.generation
+            self.initialized_generation = None
             if reason:
                 self.last_error = reason
 
-    def mark_initialized(self) -> None:
-        """Called by the client once the adapter has been (re)initialised on this connection."""
-        self.initialized_generation = self.generation
+    def fail_initialization(self, reason: str) -> None:
+        """An initialisation attempt failed: the connection is discarded before any further use."""
+        with self._lock:
+            self.init_failures += 1
+            self.init_state = "failed"
+        self.invalidate(reason)
+
+    def begin_initialization(self) -> InitAttempt:
+        """Start a new initialisation attempt; any previous initialisation is revoked.
+
+        An unsynchronised connection (incomplete exchange, failed/partial earlier
+        attempt) is discarded first, so the attempt - which starts with ATZ - always
+        runs on a connection whose stream position is known.
+        """
+        with self._lock:
+            self.initialized_generation = None
+            self._attempt = None
+            self._sync_and_connect()
+            self.init_state = "initializing"
+            self._attempt = InitAttempt(self, self.generation)
+            return self._attempt
 
     def prepare(self) -> int:
         """Resynchronise/reconnect if needed *before* a request; returns the connection generation.
@@ -135,8 +189,11 @@ class Transport(ABC):
 
     def _sync_and_connect(self) -> None:
         if not self.synced:
-            self.resyncs += 1
-            self._resync()
+            # discard the connection that lost sync; a connection opened since then
+            # (e.g. an explicit connect()) has carried nothing and is already clean
+            if self._tainted_generation == self.generation:
+                self.resyncs += 1
+                self._resync()
             self.synced = True
         self._ensure_connected()
 
@@ -152,48 +209,80 @@ class Transport(ABC):
     def _resync(self) -> None:
         """Discard the current (unsynchronised) connection; the next _ensure_connected opens a new one."""
 
-    # -- the single entry point -----------------------------------------------
+    # -- the entry points ------------------------------------------------------
     def send(self, cmd: AllowedCommand, timeout_s: float | None = None) -> Exchange:
+        """Ordinary request. Vehicle (non-AT) requests require a completed initialisation
+        on the current connection generation."""
         if not isinstance(cmd, AllowedCommand):
             raise ForbiddenRequestError("transports only accept AllowedCommand objects")
         with self._lock:  # one outstanding ELM request at a time
-            self._cancel.clear()
-            if self._last_end is not None and self.min_interval_s > 0:
-                wait = self.min_interval_s - (self.clock.monotonic() - self._last_end)
-                self.clock.sleep(wait)
             self._sync_and_connect()
-            if (
-                not cmd.is_at
-                and self.initialized_generation is not None
-                and self.generation != self.initialized_generation
+            if not cmd.is_at and (
+                self.initialized_generation is None or self.generation != self.initialized_generation
             ):
-                # a reconnect happened since the adapter was initialised: ELM settings
-                # (echo, headers, protocol) are unknown, so no vehicle request may go out
+                # never initialised, invalidated, or reconnected since: ELM settings (echo,
+                # headers, protocol) are unknown, so no vehicle request may go out
                 raise TransportUnsyncedError(
-                    "adapter connection was re-established; adapter must be re-initialised "
-                    f"before sending {cmd.text}"
+                    "adapter is not initialised on the current connection; "
+                    f"it must be (re-)initialised before sending {cmd.text}"
                 )
-            t_wall = self.clock.wall()
-            t0 = self.clock.monotonic()
-            raw, status = self._roundtrip(cmd.wire(), timeout_s or self.default_timeout_s)
-            t1 = self.clock.monotonic()
-            self._last_end = t1
-            if status in INCOMPLETE:
-                self.synced = False  # never reuse a connection whose stream position is unknown
-            self._seq += 1
-            ex = Exchange(
-                seq=self._seq,
-                t_wall=t_wall,
-                t_mono=t0,
-                request=cmd.text,
-                request_hex=cmd.wire().hex().upper(),
-                response_hex=raw.hex().upper(),
-                response_text=raw.decode("latin-1"),
-                latency_ms=round((t1 - t0) * 1000, 3),
-                status=status,  # type: ignore[arg-type]
+            return self._exchange(cmd, timeout_s)
+
+    def _send_init(self, attempt: InitAttempt, cmd: AllowedCommand, timeout_s: float | None) -> Exchange:
+        if not isinstance(cmd, AllowedCommand):
+            raise ForbiddenRequestError("transports only accept AllowedCommand objects")
+        if not cmd.is_at and cmd.text != BOOTSTRAP_REQUEST:
+            raise ForbiddenRequestError(f"initialisation may only send AT commands and {BOOTSTRAP_REQUEST}")
+        with self._lock:
+            # never resync/reconnect here: an attempt must not continue on another connection
+            self._check_attempt(attempt, f"send {cmd.text}")
+            return self._exchange(cmd, timeout_s)
+
+    def _complete_init(self, attempt: InitAttempt) -> None:
+        with self._lock:
+            self._check_attempt(attempt, "complete initialisation")
+            self.initialized_generation = attempt.generation
+            self.init_state = "initialized"
+            self._attempt = None
+
+    def _check_attempt(self, attempt: InitAttempt, what: str) -> None:
+        if attempt is not self._attempt:
+            raise TransportUnsyncedError(f"cannot {what}: initialisation attempt is no longer current")
+        if not self.synced or self.generation != attempt.generation or self.state != "connected":
+            self._attempt = None
+            raise TransportUnsyncedError(
+                f"cannot {what}: connection changed or lost sync during initialisation "
+                f"(attempt on connection #{attempt.generation}); restart initialisation from ATZ"
             )
-            for fn in list(self.listeners):
-                fn(ex)
-            if status == "closed":
-                raise TransportClosedError("adapter connection dropped during request", ex)
-            return ex
+
+    def _exchange(self, cmd: AllowedCommand, timeout_s: float | None) -> Exchange:
+        """One request -> response-until-prompt on the current connection (lock held)."""
+        self._cancel.clear()
+        if self._last_end is not None and self.min_interval_s > 0:
+            wait = self.min_interval_s - (self.clock.monotonic() - self._last_end)
+            self.clock.sleep(wait)
+        t_wall = self.clock.wall()
+        t0 = self.clock.monotonic()
+        raw, status = self._roundtrip(cmd.wire(), timeout_s or self.default_timeout_s)
+        t1 = self.clock.monotonic()
+        self._last_end = t1
+        if status in INCOMPLETE:
+            self.synced = False  # never reuse a connection whose stream position is unknown
+            self._tainted_generation = self.generation
+        self._seq += 1
+        ex = Exchange(
+            seq=self._seq,
+            t_wall=t_wall,
+            t_mono=t0,
+            request=cmd.text,
+            request_hex=cmd.wire().hex().upper(),
+            response_hex=raw.hex().upper(),
+            response_text=raw.decode("latin-1"),
+            latency_ms=round((t1 - t0) * 1000, 3),
+            status=status,  # type: ignore[arg-type]
+        )
+        for fn in list(self.listeners):
+            fn(ex)
+        if status == "closed":
+            raise TransportClosedError("adapter connection dropped during request", ex)
+        return ex

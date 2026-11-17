@@ -432,10 +432,11 @@ class FakeElmServer:
         port: int = 0,
         seed: int = 1,
         time_scale: float = 1.0,
-        script: Callable[[str, int, bytes], list[tuple[float, bytes]] | None] | None = None,
+        script: Callable[[str, int, bytes], list[tuple[float, bytes | None]] | None] | None = None,
     ) -> None:
         """``script(command, n, normal_response)`` may return ``[(delay_s, chunk), ...]`` to send
         instead of the normal response (tests use it to inject late, partial or trailing bytes).
+        A ``None`` chunk closes the connection at that point (emulated drop/reconnect).
         ``n`` counts commands across all connections, starting at 0."""
         sc = SCENARIOS[scenario] if isinstance(scenario, str) else scenario
         self.scenario = sc
@@ -480,6 +481,9 @@ class FakeElmServer:
                             try:
                                 for pause, part in scripted:
                                     time.sleep(pause)
+                                    if part is None:
+                                        sock.close()
+                                        return
                                     sock.sendall(part)
                             except OSError:
                                 return

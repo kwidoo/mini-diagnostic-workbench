@@ -59,6 +59,7 @@ class Workbench:
         self._sid: str | None = None
         self._phase = "init"
         self._stop = threading.Event()
+        self._last_status: dict[str, Any] = {}
 
     # -- vehicle profile -------------------------------------------------------
     @property
@@ -116,7 +117,21 @@ class Workbench:
     ) -> dict[str, Any]:
         """Initialise the adapter on an already-constructed transport and discover capabilities."""
         with self._exclusive("connect"):
-            return self._attach(transport, source, scenario, allow_vin)
+            with self._final_status():
+                self._attach(transport, source, scenario, allow_vin)
+            return self._last_status
+
+    @contextmanager
+    def _final_status(self):
+        """End a lifecycle operation: while still holding the operation lock (so nothing can
+        interleave), clear the operation label, then publish/keep the resulting status.
+        Runs on success and failure, so no client is left with a phantom busy state."""
+        try:
+            yield
+        finally:
+            self.operation = None  # the work is done; the lock is released right after
+            self._last_status = self.status()
+            self.hub.publish({"type": "status", "status": self._last_status})
 
     def _attach(
         self, transport: Transport, source: str, scenario: str | None = None, allow_vin: bool = False
@@ -135,7 +150,6 @@ class Workbench:
         except Exception:
             self._disconnect()
             raise
-        self.hub.publish({"type": "status", "status": self.status()})
         return self.status()
 
     def connect(
@@ -150,7 +164,9 @@ class Workbench:
         if mode == "simulator" and scenario not in SCENARIOS:
             raise KeyError(f"unknown simulator scenario {scenario!r}")
         with self._exclusive("connect"):
-            return self._connect(mode, host, port, scenario, timeout_s, min_interval_s)
+            with self._final_status():
+                self._connect(mode, host, port, scenario, timeout_s, min_interval_s)
+            return self._last_status
 
     def _connect(
         self, mode: str, host: str, port: int, scenario: str, timeout_s: float, min_interval_s: float
@@ -185,7 +201,7 @@ class Workbench:
     def disconnect(self) -> None:
         """Close the adapter connection. Rejected while a scan/inventory/recording runs:
         stop the recording first (stop_recording), then disconnect."""
-        with self._exclusive("disconnect"):
+        with self._exclusive("disconnect"), self._final_status():
             self._disconnect()
 
     def shutdown(self, wait_s: float = 10.0) -> None:
@@ -262,7 +278,9 @@ class Workbench:
                 "adapter": client.adapter.model_dump(),
                 "capabilities": client.capabilities.model_dump() if client.capabilities else None,
                 "scenario": self.scenario,
-                "transport": client.transport.describe(),
+                # the adapter-link diagnostics when the session began; the FINAL ones are
+                # written to meta["transport"] when the session ends (see finally below)
+                "transport_at_start": client.transport.describe(),
             },
         )
         self.store.add_exchanges(sid, list(self._connect_log))
@@ -275,6 +293,9 @@ class Workbench:
             self._sid = None
             self._phase = "idle"
             meta["capabilities"] = client.capabilities.model_dump() if client.capabilities else None
+            # final adapter-link diagnostics (resyncs, reconnects, last error, state...), also for
+            # cancelled/aborted sessions: what exports and session details report
+            meta["transport"] = client.transport.describe()
             meta["metrics"] = [m.model_dump() for m in compute_metrics(self.store.samples(sid))]
             self.store.update_session(sid, ended_at=clock.wall(), meta=meta)
 

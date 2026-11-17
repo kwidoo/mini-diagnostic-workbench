@@ -115,17 +115,26 @@ export const useWorkbench = defineStore('workbench', {
       })
     },
     async connect(body: { mode: string; host?: string; port?: number; scenario?: string }) {
-      await this.run('connecting', async () => {
+      const ok = await this.run('connecting', async () => {
         this.status = await api.post<Status>('/api/connect', body)
         this.plan = null
         this.inventory = null
+        return true
       })
-      if (this.error) await this.refreshStatus()
+      await this.settleStatus(ok)
     },
     async disconnect() {
-      await this.run('disconnecting', async () => {
+      const ok = await this.run('disconnecting', async () => {
         this.status = await api.post<Status>('/api/disconnect')
+        return true
       })
+      await this.settleStatus(ok)
+    },
+    /** After connect/disconnect the response is the final state. If the request failed, or the
+     *  snapshot still names a running operation, fetch the authoritative status so Connect /
+     *  Disconnect / profile controls never stay locked by a phantom busy state. */
+    async settleStatus(ok: boolean | undefined) {
+      if (!ok || this.status?.operation) await this.refreshStatus()
     },
     async scan(readVin: boolean) {
       await this.run('scanning', async () => {

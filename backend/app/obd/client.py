@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import threading
 
-from app.adapters.base import Transport
+from app.adapters.base import InitAttempt, Transport
 from app.models.domain import (
     AdapterInfo,
     Capabilities,
@@ -45,6 +45,8 @@ DTC_MODES = {"stored": 0x03, "pending": 0x07, "permanent": 0x0A}
 
 INIT_SEQUENCE = ["ATE0", "ATL0", "ATS1", "ATH1", "ATAT1", "ATSP0"]
 INIT_REQUIRED = {"ATE0", "ATH1", "ATSP0"}
+_VOLTAGE = re.compile(r"\d{1,2}(\.\d{1,2})?\s?V", re.IGNORECASE)
+_PROBE_REPLY = re.compile(r"(^|\s)41\s?00(\s|[0-9A-F]|$)", re.IGNORECASE)
 
 
 class ObdError(Exception):
@@ -166,9 +168,11 @@ def interpret_dtcs(kind: str, decoded: Decoded, family: str) -> tuple[list[Dtc],
 
 
 class ObdClient:
-    def __init__(self, transport: Transport, allow_vin: bool = False) -> None:
+    def __init__(self, transport: Transport, allow_vin: bool = False, at_timeout_s: float = 3.0) -> None:
         self.transport = transport
         self.allow_vin = allow_vin
+        self.at_timeout_s = at_timeout_s  # per AT command during initialisation (ATZ gets longer)
+        self.probe_timeout_s = 15.0  # the 0100 bootstrap probe: protocol search can take seconds
         self.adapter = AdapterInfo()
         self.capabilities: Capabilities | None = None
         self.family = "unsupported"
@@ -178,9 +182,11 @@ class ObdClient:
         self._lock = threading.RLock()
 
     # -- adapter ---------------------------------------------------------------
-    def _at(self, text: str, timeout_s: float = 3.0) -> ElmReply:
-        cmd = AllowedCommand.at(text)
-        ex = self.transport.send(cmd, timeout_s)
+    def _init_send(self, attempt: InitAttempt, cmd: AllowedCommand, timeout_s: float) -> ElmReply:
+        """One initialisation exchange. Anything but a cleanly completed exchange is fatal
+        to the attempt, whatever text it carried (a partial 'OK' without a prompt proves
+        nothing about the stream position)."""
+        ex = attempt.send(cmd, timeout_s)
         _, reply, _, _ = decode_exchange(ex, "unsupported", None)
         self.adapter.init_log.append(
             {
@@ -189,27 +195,39 @@ class ObdClient:
                 "status": reply.status.value,
             }
         )
+        if ex.status != "ok" or not reply.prompt_seen:
+            raise AdapterInitError(
+                f"incomplete adapter reply to {cmd.text} ({ex.status}: {ex.response_text!r}); "
+                "initialisation aborted, the next attempt restarts from ATZ on a fresh connection"
+            )
         return reply
+
+    def _at(self, attempt: InitAttempt, text: str, timeout_s: float | None = None) -> ElmReply:
+        return self._init_send(attempt, AllowedCommand.at(text), timeout_s or self.at_timeout_s)
 
     def initialize(self) -> AdapterInfo:
         """Safe ELM init: adapter-only AT commands, then one 0100 to bring the bus up.
 
-        Any failure leaves the connection marked unsynchronised, so the next attempt
-        starts from a fresh connection instead of an unknown stream position.
+        The whole sequence runs as ONE attempt pinned to one connection. Any failure
+        (incomplete exchange, unexpected reply, reconnect) aborts the attempt and leaves
+        the connection marked unsynchronised; vehicle requests stay refused until a later
+        attempt completes - from ATZ, on a fresh connection. One attempt per call: the
+        caller decides whether to retry (no retry loop here).
         """
         with self._lock:
             self._gen = None
             try:
                 return self._initialize()
             except Exception as exc:
-                self.transport.invalidate(f"adapter initialisation failed: {exc}")
+                self.transport.fail_initialization(f"adapter initialisation failed: {exc}")
                 raise
 
     def _initialize(self) -> AdapterInfo:
         self.adapter = AdapterInfo()
         if self.transport.state != "connected":
             self.transport.connect()
-        z = self._at("ATZ", 6.0)
+        attempt = self.transport.begin_initialization()
+        z = self._at(attempt, "ATZ", 6.0)
         if z.status != ElmStatus.OK or "ELM" not in z.text.upper():
             # also catches a late reply to an earlier request being read as the ATZ answer
             raise AdapterInitError(
@@ -217,47 +235,58 @@ class ObdClient:
                 "Is this an ELM327-compatible adapter on this host/port?"
             )
         for text in INIT_SEQUENCE:
-            r = self._at(text)
-            if text in INIT_REQUIRED and r.text.strip().upper() != "OK":
+            r = self._at(attempt, text)
+            answer = r.text.strip().upper()
+            # required settings must be confirmed; optional ones may be unknown to a clone ('?')
+            optional_unknown = text not in INIT_REQUIRED and r.status == ElmStatus.UNKNOWN_COMMAND
+            if answer != "OK" and not optional_unknown:
                 raise AdapterInitError(f"adapter rejected {text}: {r.text or r.status.value}")
-        self.transport.mark_initialized()  # vehicle requests are allowed from here on
-        self.adapter.identity = self._at("ATI").text or None
-        self.adapter.device_description = self._at("AT@1").text or None
-        self.adapter.voltage = self._at("ATRV").text or None
+        self.adapter.identity = self._info(attempt, "ATI", lambda t: "ELM" in t.upper())
+        self.adapter.device_description = self._info(attempt, "AT@1", lambda t: True)
+        self.adapter.voltage = self._info(attempt, "ATRV", lambda t: bool(_VOLTAGE.fullmatch(t)))
 
-        cmd = AllowedCommand.obd(0x01, 0x00)
-        ex = self.transport.send(cmd, 15.0)  # protocol search can take several seconds
-        _, probe, _, _ = decode_exchange(ex, "unsupported", None)
-        self.adapter.init_log.append(
-            {
-                "command": cmd.text,
-                "response": probe.text or "; ".join(probe.notes),
-                "status": probe.status.value,
-            }
-        )
+        probe = self._init_send(attempt, AllowedCommand.obd(0x01, 0x00), self.probe_timeout_s)
         if probe.status != ElmStatus.OK:
             raise EcuNotRespondingError(
                 f"adapter is alive but no ECU answered the generic OBD probe ({probe.status.value}"
                 f"{': ' + '; '.join(probe.notes) if probe.notes else ''}). "
                 "Check ignition is ON and the adapter is fully seated."
             )
-        num = (self._at("ATDPN").text or "").strip().upper()
+        if not any(_PROBE_REPLY.search(line) for line in probe.lines):
+            raise AdapterInitError(f"unexpected reply to 0100 {probe.text!r}: adapter link out of sequence")
+        num = (self._at(attempt, "ATDPN").text or "").strip().upper()
         if not re.fullmatch(r"A?[0-9A-C]", num):
             # anything else means the reply stream is out of step with our requests
             raise AdapterInitError(f"unexpected ATDPN reply {num!r}: adapter link out of sequence")
-        self.adapter.protocol_number = num or None
-        self.adapter.protocol_name = self._at("ATDP").text or PROTOCOL_NAMES.get(num.lstrip("A"))
+        dp = self._at(attempt, "ATDP")
+        self.adapter.protocol_number = num
+        self.adapter.protocol_name = (dp.text if dp.status == ElmStatus.OK else None) or PROTOCOL_NAMES.get(
+            num.lstrip("A")
+        )
         self.family = protocol_family(num)
         self.adapter.is_can = self.family == "can"
         self.adapter.is_29bit = num.lstrip("A") in ("7", "9") if self.adapter.is_can else None
-        self._gen = self.transport.generation
-        self._initialised_once = True
         if self.family == "unsupported":
             raise UnsupportedProtocolError(
                 f"vehicle protocol {num!r} ({self.adapter.protocol_name}) is not decoded by this tool "
                 "(supported: ISO 15765-4 CAN, ISO 9141-2, ISO 14230-4)."
             )
+        attempt.complete()  # the full sequence ran on this connection: vehicle requests allowed
+        self._gen = attempt.generation
+        self._initialised_once = True
         return self.adapter
+
+    def _info(self, attempt: InitAttempt, text: str, valid) -> str | None:
+        """Informational AT command: '?' (unsupported on a clone) -> None; anything that does
+        not look like an answer to THIS command means the stream is out of step -> fail."""
+        r = self._at(attempt, text)
+        if r.status == ElmStatus.UNKNOWN_COMMAND:
+            return None
+        if r.status != ElmStatus.OK or not valid(r.text.strip()):
+            raise AdapterInitError(
+                f"unexpected {text} reply {r.text or r.status.value!r}: adapter link out of sequence"
+            )
+        return r.text.strip()
 
     # -- requests ----------------------------------------------------------------
     def query(self, cmd: AllowedCommand, timeout_s: float | None = None) -> Decoded:

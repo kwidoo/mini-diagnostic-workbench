@@ -181,7 +181,9 @@ def test_unsolicited_bytes_between_exchanges_block_the_request():
 
 
 def test_connection_loss_reinitialises_before_the_next_vehicle_request():
-    sc = dataclasses.replace(SCENARIOS["wifi_drop"], drop_after_s=1.0)
+    # the drop must not hit the ~0.9 s re-initialisation itself: an init interrupted by a drop
+    # now fails as a whole (it is never continued on the next connection), see test_init_sync.py
+    sc = dataclasses.replace(SCENARIOS["wifi_drop"], drop_after_s=2.0)
     with FakeElmServer(sc) as srv:
         t, c, seen = _client(srv, timeout=2)
         closed = None

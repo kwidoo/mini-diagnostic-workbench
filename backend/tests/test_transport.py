@@ -146,8 +146,7 @@ def test_reconnect_gives_up_with_clear_error():
 def test_cancel_and_graceful_close():
     with FakeElmServer("slow_adapter") as srv:
         t = VgateWiFiTransport(srv.host, srv.port)
-        t.connect()
-        t.send(AllowedCommand.at("ATE0"))
+        ObdClient(t).initialize()  # vehicle requests are refused on an uninitialised connection
         threading.Timer(0.05, t.cancel).start()
         ex = t.send(AllowedCommand.obd(1, 0x0C), timeout_s=5)
         assert ex.status == "cancelled" and ex.latency_ms < 2000

@@ -51,6 +51,12 @@ def samples_csv(samples: list[dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
+_LINK_COUNTERS = [
+    ("resyncs", "resynchronisation(s) after incomplete replies"),
+    ("reconnects", "reconnect(s)"),
+]
+
+
 def render_report(session: dict[str, Any], scans: list, annotations: list, findings: list[Finding]) -> str:
     prof = get_profile(session["vehicle_profile"])
     meta = session["meta"]
@@ -72,6 +78,13 @@ def render_report(session: dict[str, Any], scans: list, annotations: list, findi
         f"- Started: {_iso(session['started_at'])} | ended: {_iso(session['ended_at'])}",
         f"- Adapter: {(meta.get('adapter') or {}).get('identity') or 'unknown'} | protocol: {(meta.get('adapter') or {}).get('protocol_name') or 'unknown'}",
     ]
+    tr = meta.get("transport")
+    if tr:
+        parts = [f"{tr[k]} {label}" for k, label in _LINK_COUNTERS if tr.get(k) is not None]
+        parts.append(f"state {tr.get('state')}")
+        if tr.get("last_error"):
+            parts.append(f"last error: {tr['last_error']}")
+        out += ["- Adapter link at end of session: " + ", ".join(parts)]
     vi = meta.get("vehicle_info")
     if vi:
         cal = ", ".join(c["text"] for c in vi.get("calibration_ids", [])) or "not reported"

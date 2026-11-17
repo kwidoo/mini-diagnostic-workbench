@@ -29,7 +29,21 @@ Init answers are checked, not just logged: `ATZ` must answer with an `ELM` ident
 `ATE0`/`ATH1`/`ATSP0` must answer exactly `OK`, `ATDPN` must be a protocol number. Any
 other answer means the reply stream is out of step with the requests (for example a
 late ECU answer read as the `ATZ` reply); init then fails and the connection is
-discarded.
+discarded. Optional commands (`ATL0`, `ATS1`, `ATAT1`) may also answer `?` (clones);
+`ATI` must contain `ELM`, `ATRV` must be a voltage, `0100` must carry a `41 00` answer.
+
+Init is all-or-nothing per connection. The sequence runs as one *attempt* pinned to one
+TCP connection (`Transport.begin_initialization`). Every init exchange - required or
+optional AT command, the `0100` probe, the protocol readback - must complete cleanly with
+a prompt; an incomplete one (timeout, partial `OK` without `>`, bytes after the prompt,
+dropped TCP) aborts the attempt whatever text it carried. The attempt never reconnects
+and never continues on another connection: the next attempt starts again with `ATZ` on a
+fresh one. Vehicle requests are allowed only once an attempt has completed on the
+current connection; a connection that was never initialised is refused just like one
+that was re-established. The `0100` probe is the only vehicle request an attempt may
+send. Each call to `ObdClient.initialize()` makes one attempt (no retry loop); failures
+are counted in the transport status (`init_state`, `init_failures`) and the raw
+exchanges stay in the init log/trace.
 
 ## Resynchronisation
 
@@ -52,7 +66,10 @@ An unsynchronised connection is never reused. Before the next request the client
 the new connection, (3) only then sends the vehicle request. The transport refuses any
 vehicle (non-AT) request on a connection the adapter has not been re-initialised on
 (`TransportUnsyncedError`). A reply from an incomplete exchange is never decoded into a
-value, live or on replay. Regression tests: backend/tests/test_resync.py (real sockets
+value, live or on replay. Sessions store the adapter-link diagnostics both when they
+start (`meta.transport_at_start`) and when they end (`meta.transport`, the final values
+used by exports and reports). Regression tests: backend/tests/test_init_sync.py,
+backend/tests/test_resync.py (real sockets
 against the fake ELM327, with the late reply arriving after the next request was sent).
 
 Not hardware-validated: whether a real Vgate adapter forwards a late ECU answer to a

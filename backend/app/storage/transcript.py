@@ -36,6 +36,7 @@ def transcript_lines(store: Store, sid: str, include_vin: bool = False) -> list[
         "scenario": meta.get("scenario"),
         "adapter": meta.get("adapter"),
         "capabilities": meta.get("capabilities"),
+        "transport": meta.get("transport"),  # final adapter-link diagnostics (optional key)
         "note": "SYNTHETIC simulator data - not a measurement from a real vehicle"
         if session["synthetic"]
         else "recorded from a real adapter",
