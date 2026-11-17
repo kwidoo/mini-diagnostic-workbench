@@ -9,8 +9,20 @@ export interface AdapterInfo {
 export interface Recording { session_id: string; started_at: number; duration_s: number; fast: number[]; slow: number[]; unsupported: number[] }
 export interface Status {
   read_only: true; connected: boolean; source: string; synthetic: boolean; scenario: string | null
-  transport: { kind: string; state: string; last_error: string | null; host?: string; port?: number; reconnects?: number } | null
+  transport: {
+    kind: string; state: string; last_error: string | null; host?: string; port?: number; reconnects?: number
+    synced?: boolean; resyncs?: number
+  } | null
   adapter: AdapterInfo | null; capabilities: Capabilities | null; recording: Recording | null; vehicle_profile: string
+  /** running workbench operation (scan | inventory | recording | connect | ...), null when idle */
+  operation?: string | null
+  /** profile the current connection was opened (and probed) for */
+  connected_profile?: string | null
+}
+/** Kept deliberately separate: generic OBD readiness says nothing about manufacturer data or hardware validation. */
+export interface ProfileCapabilities {
+  generic_obd: 'ready' | 'incremental'; manufacturer_diagnostics: 'available' | 'not_available'; manufacturer_note: string
+  hardware_validated: boolean; hardware_validation_note: string
 }
 export interface MfrParam { key: string; name: string; unit: string | null; status: string; value: null; reason: string }
 export interface MfrExtension { id: string; ecu: string; enabled: boolean; verified: boolean; access_requirements: string; parameters: MfrParam[] }
@@ -25,6 +37,7 @@ export interface Profile {
   priority_pids: PidRef[]; recording_profiles: { id: string; name: string }[]; event_labels: string[]
   first_run_checklist: string[]; scenarios: { name: string; description: string }[]; manufacturer: MfrExtension[]
   owner_reported: OwnerReported
+  capabilities: ProfileCapabilities
 }
 export interface VehicleRecord { confirmed: Record<string, string>; owner_reported: OwnerReported }
 export interface Reading {

@@ -4,6 +4,11 @@ Status words: **implemented** (code + tests against the simulator), **raw only**
 (bytes stored, no physical value shown), **unavailable** (no request is sent).
 Nothing in this table has been validated on a real car yet.
 
+Three things are reported separately and never merged into one "complete" flag:
+generic OBD support (this table), manufacturer DDE/DME diagnostics (not implemented:
+see "BMW DDE: what would be needed"), and hardware validation (none yet). The profile
+status `generic_obd_ready` refers to the first one only.
+
 ## Adapter and protocols
 
 | Item | Status | Notes |

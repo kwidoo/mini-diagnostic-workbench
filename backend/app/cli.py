@@ -208,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {msg}", file=sys.stderr)
         return 2
     finally:
-        wb.disconnect()
+        wb.shutdown()
         store.close()
 
 
@@ -224,7 +224,11 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             )
         else:
             for p in PROFILES.values():
-                print(f"{'*' if p.id == wb.profile.id else ' '} {p.id:<30} {p.name}  [{p.status}]")
+                hw = "hardware-validated" if p.hardware_validated else "NOT hardware-validated"
+                print(
+                    f"{'*' if p.id == wb.profile.id else ' '} {p.id:<30} {p.name}  "
+                    f"[{p.status}; manufacturer DDE/DME data: not read; {hw}]"
+                )
         return 0
 
     if a.cmd == "probe":

@@ -1,9 +1,22 @@
 # Vehicle profiles
 
-| Profile id | Status | ECU definition | Expected protocol | Rules |
+| Profile id | Generic OBD status | ECU definition | Expected protocol | Rules |
 |---|---|---|---|---|
-| `mini-countryman-r60-diesel` | complete | BMW DDE, variant unconfirmed | CAN | idle stability, air path EGR/MAF, DPF / 480A, DDE 4862, progression, repair history, manufacturer-data availability |
-| `porsche-boxster-986-mk2` | in progress | Bosch ME7.8, variant unconfirmed | K-line | idle stability, fuel-trim bank balance, progression, manufacturer-data availability |
+| `mini-countryman-r60-diesel` | `generic_obd_ready` | BMW DDE, variant unconfirmed | CAN | idle stability, air path EGR/MAF, DPF / 480A, DDE 4862, progression, repair history, manufacturer-data availability |
+| `porsche-boxster-986-mk2` | `generic_obd_incremental` | Bosch ME7.8, variant unconfirmed | K-line | idle stability, fuel-trim bank balance, progression, manufacturer-data availability |
+
+The status covers **generic OBD only**. Each profile also carries two separate
+indicators, shown side by side in the Vehicle tab and returned by `/api/profiles`:
+manufacturer diagnostics (BMW DDE / Bosch DME fault memory and parameters: **not read**
+by this tool for either car) and hardware validation (**false** for both: simulator
+only, see docs/HARDWARE_SETUP_MAC.md). Owner-reported BMW codes 4862 / 480A are stored
+as history and labelled "not read from the car"; the tool never claims to have read them.
+
+Hardware validation log: none yet.
+
+Profile switching is refused during any scan, inventory or recording, and while
+connected: disconnect first, so the other vehicle is probed on a fresh connection and
+no capabilities of one ECU are reused under another profile.
 
 Select one in the dashboard header or Vehicle tab, or with `mini-obd profiles --use <id>`
 (or `--vehicle <id>` for one command). The choice is stored; every session is tagged

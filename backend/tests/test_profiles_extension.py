@@ -16,7 +16,11 @@ from app.vehicles.profiles import DEFAULT_PROFILE_ID, PROFILES, get_profile
 
 def test_two_profiles_with_separate_ecus_protocols_and_rules():
     mini, porsche = PROFILES["mini-countryman-r60-diesel"], PROFILES["porsche-boxster-986-mk2"]
-    assert DEFAULT_PROFILE_ID == mini.id and mini.status == "complete" and porsche.status == "incremental"
+    assert (
+        DEFAULT_PROFILE_ID == mini.id
+        and mini.status == "generic_obd_ready"
+        and porsche.status == "generic_obd_incremental"
+    )
     assert mini.expected_protocol_families == ("can",) and porsche.expected_protocol_families == ("kline",)
     assert mini.ecu_ids != porsche.ecu_ids and set(mini.ecu_ids + porsche.ecu_ids) <= set(ECU_DEFINITIONS)
     assert "dde_4862" in mini.rule_ids and "dde_4862" not in porsche.rule_ids
@@ -84,3 +88,20 @@ def test_extension_cannot_declare_manufacturer_requests():
 
     with pytest.raises(ExtensionUnavailableError):
         ExtensionRegistry().register(Rogue())
+
+
+def test_profile_status_separates_generic_manufacturer_and_hardware_validation():
+    """P1-4: no profile may claim 'complete' while BMW/Porsche manufacturer data is not read."""
+    for p in PROFILES.values():
+        assert p.status in ("generic_obd_ready", "generic_obd_incremental") and p.status != "complete"
+        caps = p.to_dict()["capabilities"]
+        assert caps["manufacturer_diagnostics"] == "not_available"
+        assert (
+            caps["hardware_validated"] is False
+            and "Not hardware-validated" in caps["hardware_validation_note"]
+        )
+    mini = PROFILES["mini-countryman-r60-diesel"]
+    assert mini.to_dict()["capabilities"]["generic_obd"] == "ready"
+    # owner-reported BMW codes are labelled as history, never as something this tool read
+    for c in mini.owner_reported["manufacturer_fault_codes"]:
+        assert "not read by this tool" in c["source"]

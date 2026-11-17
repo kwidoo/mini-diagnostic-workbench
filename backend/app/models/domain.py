@@ -31,7 +31,9 @@ class Exchange(BaseModel):
     response_hex: str
     response_text: str
     latency_ms: float
-    status: Literal["ok", "timeout", "partial", "closed", "cancelled", "redacted"]
+    # desync: unexpected bytes before the request or after the prompt; the reply is
+    # kept raw but never decoded into a value, and the connection is discarded
+    status: Literal["ok", "timeout", "partial", "closed", "cancelled", "desync", "redacted"]
     phase: str = ""  # init | discover | scan:<phase> | record | inventory (set by the workbench)
 
 

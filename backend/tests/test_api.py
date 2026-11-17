@@ -163,3 +163,13 @@ def test_replay_fixture_and_compare(api):
     assert idle["strength"] == "strong"
     for bad in ("../backend/pyproject.toml", "/etc/passwd", "nope.jsonl", "..\\x.jsonl"):
         assert api.post("/api/replay", json={"fixture": bad}).status_code == 404
+
+
+def test_profiles_expose_separate_capability_indicators(api):
+    by_id = {p["id"]: p for p in api.get("/api/profiles").json()["profiles"]}
+    mini = by_id["mini-countryman-r60-diesel"]
+    assert mini["status"] == "generic_obd_ready"
+    assert mini["capabilities"]["generic_obd"] == "ready"
+    assert mini["capabilities"]["manufacturer_diagnostics"] == "not_available"
+    assert mini["capabilities"]["hardware_validated"] is False
+    assert by_id["porsche-boxster-986-mk2"]["capabilities"]["generic_obd"] == "incremental"

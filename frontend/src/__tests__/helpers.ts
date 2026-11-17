@@ -3,7 +3,7 @@ import type { Profile, Status } from '../types'
 
 export const miniProfile: Profile = {
   id: 'mini-countryman-r60-diesel', name: 'MINI Countryman R60 2.0 Diesel (BMW DDE)', make: 'MINI', model: 'Countryman', engine: '2.0 diesel',
-  fuel: 'diesel', status: 'complete', identity_note: 'Owner-reported. NOT confirmed until read from the car.', protocol_note: 'CAN expected',
+  fuel: 'diesel', status: 'generic_obd_ready', identity_note: 'Owner-reported. NOT confirmed until read from the car.', protocol_note: 'CAN expected',
   expected_protocol_families: ['can'],
   ecus: [{ id: 'bmw-dde-unconfirmed', name: 'BMW DDE', family: 'DDE', variant_confirmed: false, variant_note: 'unknown', generic_obd_note: '' }],
   priority_pids: [], recording_profiles: [{ id: 'idle', name: 'Idle investigation' }], event_labels: ['rough idle started', 'MIL on'],
@@ -12,18 +12,21 @@ export const miniProfile: Profile = {
     parameters: [{ key: 'dpf_soot_load', name: 'DPF soot load', unit: null, status: 'unavailable', value: null, reason: 'unverified' }] }],
   owner_reported: { symptoms: ['idle fluctuation'], manufacturer_fault_codes: [{ code: '4862', system: 'BMW DDE', source: 'owner report' }],
     repairs: [{ description: 'EGR cooler replaced', verified: false }], notes: '' },
+  capabilities: { generic_obd: 'ready', manufacturer_diagnostics: 'not_available', manufacturer_note: 'BMW DDE fault memory is not read by this tool.',
+    hardware_validated: false, hardware_validation_note: 'Not hardware-validated: simulator only.' },
 }
 export const porscheProfile: Profile = {
-  ...miniProfile, id: 'porsche-boxster-986-mk2', name: 'Porsche Boxster 986 Mk2 (Bosch ME7.8)', status: 'incremental',
+  ...miniProfile, id: 'porsche-boxster-986-mk2', name: 'Porsche Boxster 986 Mk2 (Bosch ME7.8)', make: 'Porsche', status: 'generic_obd_incremental',
+  capabilities: { ...miniProfile.capabilities, generic_obd: 'incremental' },
   expected_protocol_families: ['kline'], scenarios: [{ name: 'porsche_healthy_idle', description: 'synthetic' }],
   owner_reported: { symptoms: [], manufacturer_fault_codes: [], repairs: [], notes: '' },
 }
 export const disconnected: Status = {
   read_only: true, connected: false, source: 'none', synthetic: false, scenario: null, transport: null, adapter: null,
-  capabilities: null, recording: null, vehicle_profile: miniProfile.id,
+  capabilities: null, recording: null, vehicle_profile: miniProfile.id, operation: null, connected_profile: null,
 }
 export const connected: Status = {
-  ...disconnected, connected: true, source: 'simulator', synthetic: true, scenario: 'rough_idle',
+  ...disconnected, connected: true, source: 'simulator', synthetic: true, scenario: 'rough_idle', connected_profile: miniProfile.id,
   transport: { kind: 'vgate-wifi-tcp', state: 'connected', last_error: null, host: '127.0.0.1', port: 1, reconnects: 0 },
   adapter: { identity: 'ELM327 v2.3', device_description: 'SIM', voltage: '14.1V', protocol_number: 'A6',
     protocol_name: 'AUTO, ISO 15765-4 (CAN 11/500)', is_can: true, init_log: [{ command: 'ATZ', response: 'ELM327 v2.3', status: 'ok' }] },

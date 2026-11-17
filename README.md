@@ -22,6 +22,29 @@ Details: [docs/OBD_SUPPORT_MATRIX.md](docs/OBD_SUPPORT_MATRIX.md).
 **Not yet validated on a car.** Everything was built and tested against the built-in
 fake ELM327. The first real connection is the test of the adapter assumptions listed
 in [docs/DIAGNOSTIC_PROTOCOL.md](docs/DIAGNOSTIC_PROTOCOL.md).
+Profile status `generic_obd_ready` means generic OBD only: manufacturer DDE/DME
+diagnostics are not implemented, and no profile is hardware-validated yet. Follow the
+checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
+real session.
+
+### Last verified test run (2026-11-17, Linux VM, Python 3.15, Node 22)
+
+```
+$ cd backend && uv run ruff check app tests && uv run pytest
+All checks passed!
+242 passed in 58.34s
+$ cd frontend && npm run typecheck && npm test
+> vue-tsc --noEmit
+ Test Files  4 passed (4)
+      Tests  22 passed (22)
+```
+
+Covered since the review follow-up: late/partial/trailing replies and cancel/timeout/
+connection loss on real sockets (`tests/test_resync.py`), concurrent lifecycle
+operations through the HTTP API (`tests/test_lifecycle.py`), EGR-error statistics
+(`tests/test_egr.py`), the hardware checklist against the allowlist
+(`tests/test_hardware_checklist.py`), and the UI guards/indicators
+(`src/__tests__/lifecycle.spec.ts`). Not covered: real hardware, browser end-to-end.
 
 ## Setup on a clean Mac (Apple Silicon)
 

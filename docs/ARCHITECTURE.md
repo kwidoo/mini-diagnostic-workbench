@@ -26,6 +26,24 @@
                      Vgate iCar Pro (TCP)  or  FakeElmServer (TCP, synthetic)
 ```
 
+## Operation lifecycle
+
+`Workbench` owns one non-blocking operation guard shared by connect, disconnect,
+profile switch, scan, inventory and record. A second operation is rejected with
+`BusyError` (HTTP 409) naming the one in progress; nothing is queued. A recording is
+ended with `POST /api/recording/stop`, then `POST /api/disconnect` works. The
+connection remembers the profile it was opened for (`connected_profile`): switching
+to another profile while connected is refused (disconnect + reconnect re-probes the
+vehicle), and a session refuses to start if the stored active profile no longer
+matches the connection (e.g. changed by the CLI in the shared database). Process
+shutdown (`Workbench.shutdown`) stops a recording, cancels the request in flight and
+waits for the session to close before disconnecting. `/api/status` exposes
+`operation` and `connected_profile`; the dashboard disables the matching controls.
+
+Below the workbench, `ObdClient` serialises re-init + request, and the transport
+serialises single wire exchanges and discards any connection whose reply stream is
+out of step (see DIAGNOSTIC_PROTOCOL.md, "Resynchronisation").
+
 ## Multi-vehicle separation
 
 | Concern | Where | Vehicle-specific? |

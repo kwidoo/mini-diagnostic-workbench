@@ -42,6 +42,21 @@ export const useWorkbench = defineStore('workbench', {
     profile: (s): Profile | null => s.profiles.find((p) => p.id === s.activeProfileId) ?? null,
     connected: (s): boolean => !!s.status?.connected,
     recording: (s) => s.status?.recording ?? null,
+    /** Why switching to another vehicle profile is refused right now (mirrors the backend's 409 rules). */
+    profileLockReason: (s): string | null => {
+      const st = s.status
+      if (st?.recording) return 'Stop the recording before switching vehicle.'
+      if (st?.operation) return `Wait for the running ${st.operation} to finish before switching vehicle.`
+      if (st?.connected) return 'Disconnect before switching vehicle: the other vehicle must be probed on a fresh connection.'
+      return null
+    },
+    /** Why disconnect is refused right now: an operation must be stopped / finish first. */
+    disconnectLockReason: (s): string | null => {
+      const st = s.status
+      if (st?.recording) return 'Stop the recording first, then disconnect.'
+      if (st?.operation) return `Wait for the running ${st.operation} to finish, then disconnect.`
+      return null
+    },
     connectionState: (s): string => {
       if (!s.status) return 'unknown'
       if (s.status.connected) return 'connected'
@@ -100,17 +115,26 @@ export const useWorkbench = defineStore('workbench', {
       })
     },
     async connect(body: { mode: string; host?: string; port?: number; scenario?: string }) {
-      await this.run('connecting', async () => {
+      const ok = await this.run('connecting', async () => {
         this.status = await api.post<Status>('/api/connect', body)
         this.plan = null
         this.inventory = null
+        return true
       })
-      if (this.error) await this.refreshStatus()
+      await this.settleStatus(ok)
     },
     async disconnect() {
-      await this.run('disconnecting', async () => {
+      const ok = await this.run('disconnecting', async () => {
         this.status = await api.post<Status>('/api/disconnect')
+        return true
       })
+      await this.settleStatus(ok)
+    },
+    /** After connect/disconnect the response is the final state. If the request failed, or the
+     *  snapshot still names a running operation, fetch the authoritative status so Connect /
+     *  Disconnect / profile controls never stay locked by a phantom busy state. */
+    async settleStatus(ok: boolean | undefined) {
+      if (!ok || this.status?.operation) await this.refreshStatus()
     },
     async scan(readVin: boolean) {
       await this.run('scanning', async () => {

@@ -126,8 +126,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
-        wb.stop_recording()
-        wb.disconnect()
+        wb.shutdown()
 
     app = FastAPI(title="MINI Diagnostic Workbench", version="0.1.0", lifespan=lifespan)
     app.state.wb = wb
@@ -159,13 +158,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 if s.vehicle == p.id
             ]
             d["manufacturer"] = wb.registry.status(p.ecu_ids)
+            d["capabilities"] = p.capability_indicators(any(m["enabled"] for m in d["manufacturer"]))
             out.append(d)
         return {"active": wb.profile.id, "profiles": out}
 
     @app.put("/api/profiles/active")
     def set_profile(body: ProfileBody) -> dict[str, Any]:
-        if wb.active:
-            raise BusyError("cannot switch vehicle profile while recording")
+        # rejected (409) during any operation and while connected to a different vehicle
         return {"active": wb.set_profile(body.id).id}
 
     @app.get("/api/vehicle")
@@ -194,7 +193,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/disconnect")
     def disconnect() -> dict[str, Any]:
-        wb.stop_recording()
+        # rejected (409) while a scan/inventory/recording runs: POST /api/recording/stop first
         wb.disconnect()
         return wb.status()
 
