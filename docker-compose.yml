@@ -1,0 +1,23 @@
+services:
+  test:
+    build: .
+    command: sh -c "uv run ruff check app tests && uv run pytest"
+  test-frontend:
+    image: node:22-slim
+    working_dir: /src
+    volumes:
+      - ./frontend:/src
+      - /src/node_modules
+    command: sh -c "npm ci && npm run typecheck && npm test"
+  demo:
+    build: .
+    working_dir: /tmp
+    command: uv run --project /srv/backend mini-obd demo
+  serve:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"   # published on the Mac's loopback only
+    volumes:
+      - mini-obd-data:/data
+volumes:
+  mini-obd-data:
