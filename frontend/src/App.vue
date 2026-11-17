@@ -30,8 +30,11 @@ onMounted(async () => {
       <h1 class="text-lg font-semibold">Diagnostic Workbench</h1>
       <label class="flex items-center gap-2 text-sm">
         <span class="label">Vehicle</span>
-        <select class="field" data-test="profile-select" :value="wb.activeProfileId" :disabled="!!wb.recording" @change="wb.setProfile(($event.target as HTMLSelectElement).value)">
-          <option v-for="p in wb.profiles" :key="p.id" :value="p.id">{{ p.name }}{{ p.status === 'incremental' ? ' (in progress)' : '' }}</option>
+        <select
+          class="field" data-test="profile-select" :value="wb.activeProfileId" :disabled="!!wb.profileLockReason"
+          :title="wb.profileLockReason ?? ''" @change="wb.setProfile(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="p in wb.profiles" :key="p.id" :value="p.id">{{ p.name }}{{ p.capabilities?.generic_obd === 'ready' ? '' : ' (in progress)' }}</option>
         </select>
       </label>
       <span class="badge" data-test="read-only" title="This tool cannot clear faults, reset adaptations, actuate components or trigger a DPF regeneration.">

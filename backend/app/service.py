@@ -30,6 +30,10 @@ class NotConnectedError(Exception):
     pass
 
 
+class ProfileMismatchError(BusyError):
+    """The active vehicle profile is not the one the current connection was established for."""
+
+
 class Workbench:
     def __init__(
         self, store: Store, hub: LiveHub | None = None, registry: ExtensionRegistry | None = None
@@ -43,7 +47,12 @@ class Workbench:
         self.source = "none"  # real | simulator
         self.scenario: str | None = None
         self.active: dict[str, Any] | None = None  # the running recording, if any
+        # ONE lock for every lifecycle step that touches the adapter or its identity:
+        # connect, disconnect, profile switch, scan, inventory, record. Never blocks:
+        # a second operation is rejected with BusyError naming the one in progress.
         self._op = threading.Lock()
+        self.operation: str | None = None
+        self.connected_profile: str | None = None  # profile the current connection was opened for
         self._buf_lock = threading.Lock()
         self._ex_buf: list[Exchange] = []
         self._connect_log: list[Exchange] = []
@@ -58,9 +67,30 @@ class Workbench:
         return get_profile(pid if pid in PROFILES else DEFAULT_PROFILE_ID)
 
     def set_profile(self, profile_id: str) -> VehicleProfile:
+        """Switch vehicle profile. Refused during any operation and while connected to a
+        different vehicle: capabilities discovered on one ECU must never be reused under
+        another profile, so switching requires disconnect + a new connection (re-probe)."""
         prof = get_profile(profile_id)
-        self.store.set_setting("active_profile", prof.id)
+        with self._exclusive("switch vehicle profile"):
+            if self.client is not None and self.connected_profile not in (None, prof.id):
+                raise ProfileMismatchError(
+                    f"connected for {self.connected_profile}; disconnect before switching to {prof.id} "
+                    "(the new vehicle must be probed on a fresh connection)"
+                )
+            self.store.set_setting("active_profile", prof.id)
         return prof
+
+    @contextmanager
+    def _exclusive(self, what: str):
+        if not self._op.acquire(blocking=False):
+            running = self.operation or "another operation"
+            raise BusyError(f"cannot {what}: {running} in progress (stop it first)")
+        self.operation = what
+        try:
+            yield
+        finally:
+            self.operation = None
+            self._op.release()
 
     def vehicle_record(self, profile_id: str | None = None) -> dict[str, Any]:
         """User-confirmed identity + owner-reported context for a profile (editable)."""
@@ -85,8 +115,15 @@ class Workbench:
         self, transport: Transport, source: str, scenario: str | None = None, allow_vin: bool = False
     ) -> dict[str, Any]:
         """Initialise the adapter on an already-constructed transport and discover capabilities."""
-        self.disconnect()
+        with self._exclusive("connect"):
+            return self._attach(transport, source, scenario, allow_vin)
+
+    def _attach(
+        self, transport: Transport, source: str, scenario: str | None = None, allow_vin: bool = False
+    ) -> dict[str, Any]:
+        self._disconnect()
         self.transport, self.source, self.scenario = transport, source, scenario
+        self.connected_profile = self.profile.id
         self._connect_log = []
         transport.listeners.append(self._on_exchange)
         self.client = ObdClient(transport, allow_vin=allow_vin)
@@ -96,7 +133,7 @@ class Workbench:
             self._phase = "discover"
             self.client.discover()
         except Exception:
-            self.disconnect()
+            self._disconnect()
             raise
         self.hub.publish({"type": "status", "status": self.status()})
         return self.status()
@@ -110,12 +147,16 @@ class Workbench:
         timeout_s: float = 5.0,
         min_interval_s: float = 0.0,
     ) -> dict[str, Any]:
-        if self.active:
-            raise BusyError("a recording is running")
+        if mode == "simulator" and scenario not in SCENARIOS:
+            raise KeyError(f"unknown simulator scenario {scenario!r}")
+        with self._exclusive("connect"):
+            return self._connect(mode, host, port, scenario, timeout_s, min_interval_s)
+
+    def _connect(
+        self, mode: str, host: str, port: int, scenario: str, timeout_s: float, min_interval_s: float
+    ) -> dict[str, Any]:
         if mode == "simulator":
-            if scenario not in SCENARIOS:
-                raise KeyError(f"unknown simulator scenario {scenario!r}")
-            self.disconnect()
+            self._disconnect()
             server = FakeElmServer(scenario).start()
             transport = VgateWiFiTransport(
                 server.host,
@@ -126,7 +167,7 @@ class Workbench:
                 backoff_initial_s=0.2,
             )
             try:
-                st = self.attach(transport, "simulator", scenario)
+                st = self._attach(transport, "simulator", scenario)
             except Exception:
                 server.stop()
                 raise
@@ -139,9 +180,29 @@ class Workbench:
             default_timeout_s=timeout_s,
             min_interval_s=min_interval_s,
         )
-        return self.attach(transport, "real")
+        return self._attach(transport, "real")
 
     def disconnect(self) -> None:
+        """Close the adapter connection. Rejected while a scan/inventory/recording runs:
+        stop the recording first (stop_recording), then disconnect."""
+        with self._exclusive("disconnect"):
+            self._disconnect()
+
+    def shutdown(self, wait_s: float = 10.0) -> None:
+        """Process exit: stop a recording, cancel the request in flight, wait for the running
+        operation to close its session cleanly, then disconnect."""
+        self._stop.set()
+        if self.transport is not None:
+            self.transport.cancel()
+        if self._op.acquire(timeout=wait_s):
+            try:
+                self._disconnect()
+            finally:
+                self._op.release()
+        elif self.transport is not None:
+            self.transport.close()  # the operation is stuck; its own error handling ends the session
+
+    def _disconnect(self) -> None:
         self._stop.set()
         if self.transport is not None:
             self.transport.close()
@@ -149,6 +210,7 @@ class Workbench:
             self.sim_server.stop()
         self.transport = self.client = self.sim_server = None
         self.source, self.scenario = "none", None
+        self.connected_profile = None
 
     def status(self) -> dict[str, Any]:
         c = self.client
@@ -162,7 +224,9 @@ class Workbench:
             "adapter": c.adapter.model_dump() if c else None,
             "capabilities": c.capabilities.model_dump() if c and c.capabilities else None,
             "recording": self.active,
+            "operation": self.operation,
             "vehicle_profile": self.profile.id,
+            "connected_profile": self.connected_profile,
         }
 
     def _need_client(self) -> ObdClient:
@@ -173,39 +237,46 @@ class Workbench:
     # -- sessions ----------------------------------------------------------------
     @contextmanager
     def _session(self, kind: str, label: str):
-        client = self._need_client()
-        if not self._op.acquire(blocking=False):
-            raise BusyError("another scan or recording is in progress")
+        what = {"scan": "scan", "snapshot": "inventory", "record": "recording"}[kind]
+        with self._exclusive(what):
+            client = self._need_client()
+            if self.connected_profile != self.profile.id:  # e.g. changed by another process
+                raise ProfileMismatchError(
+                    f"active profile {self.profile.id} does not match the connected vehicle "
+                    f"({self.connected_profile}); reconnect to probe the vehicle again"
+                )
+            with self._session_body(kind, label, client) as ctx:
+                yield ctx
+
+    @contextmanager
+    def _session_body(self, kind: str, label: str, client: ObdClient):
         clock = client.transport.clock
+        sid = self.store.create_session(
+            kind=kind,
+            vehicle_profile=self.profile.id,
+            source=self.source,
+            synthetic=self.source != "real",
+            label=label,
+            started_at=clock.wall(),
+            meta={
+                "adapter": client.adapter.model_dump(),
+                "capabilities": client.capabilities.model_dump() if client.capabilities else None,
+                "scenario": self.scenario,
+                "transport": client.transport.describe(),
+            },
+        )
+        self.store.add_exchanges(sid, list(self._connect_log))
+        self._sid = sid
+        meta: dict[str, Any] = {}
         try:
-            sid = self.store.create_session(
-                kind=kind,
-                vehicle_profile=self.profile.id,
-                source=self.source,
-                synthetic=self.source != "real",
-                label=label,
-                started_at=clock.wall(),
-                meta={
-                    "adapter": client.adapter.model_dump(),
-                    "capabilities": client.capabilities.model_dump() if client.capabilities else None,
-                    "scenario": self.scenario,
-                    "transport": client.transport.describe(),
-                },
-            )
-            self.store.add_exchanges(sid, list(self._connect_log))
-            self._sid = sid
-            meta: dict[str, Any] = {}
-            try:
-                yield sid, client, meta
-            finally:
-                self._flush()
-                self._sid = None
-                self._phase = "idle"
-                meta["capabilities"] = client.capabilities.model_dump() if client.capabilities else None
-                meta["metrics"] = [m.model_dump() for m in compute_metrics(self.store.samples(sid))]
-                self.store.update_session(sid, ended_at=clock.wall(), meta=meta)
+            yield sid, client, meta
         finally:
-            self._op.release()
+            self._flush()
+            self._sid = None
+            self._phase = "idle"
+            meta["capabilities"] = client.capabilities.model_dump() if client.capabilities else None
+            meta["metrics"] = [m.model_dump() for m in compute_metrics(self.store.samples(sid))]
+            self.store.update_session(sid, ended_at=clock.wall(), meta=meta)
 
     def _flush(self, readings: list[Reading] | None = None) -> None:
         with self._buf_lock:
@@ -255,8 +326,8 @@ class Workbench:
         started: threading.Event | None = None,
     ) -> str:
         plan = self.plan_recording(profile_id, pids)
-        self._stop = threading.Event()
         with self._session("record", label) as (sid, client, meta):
+            self._stop = threading.Event()  # only once we own the operation lock
             clock = client.transport.clock
             meta.update(
                 selected=plan, recording_profile=None if pids else profile_id, requested_duration_s=duration_s

@@ -35,11 +35,18 @@ function connect() {
       </label>
       <div class="mt-3 flex gap-2">
         <button class="btn-primary" data-test="connect" :disabled="!!wb.busy || wb.connected" @click="connect">Connect</button>
-        <button class="btn" data-test="disconnect" :disabled="!!wb.busy || !wb.connected" @click="wb.disconnect()">Disconnect</button>
+        <button
+          class="btn" data-test="disconnect" :disabled="!!wb.busy || !wb.connected || !!wb.disconnectLockReason"
+          :title="wb.disconnectLockReason ?? ''" @click="wb.disconnect()"
+        >Disconnect</button>
       </div>
+      <p v-if="wb.connected && wb.disconnectLockReason" class="mt-2 text-sm text-warn" data-test="disconnect-hint">{{ wb.disconnectLockReason }}</p>
       <p class="mt-3 text-sm" data-test="conn-state">
         State: <b>{{ wb.connectionState }}</b>
         <span v-if="wb.status?.transport?.reconnects"> · {{ wb.status.transport.reconnects }} reconnect(s)</span>
+        <span v-if="wb.status?.transport?.resyncs" data-test="resyncs">
+          · {{ wb.status.transport.resyncs }} resynchronisation(s) after incomplete replies (affected readings are marked, never reused)
+        </span>
         <span v-if="wb.status?.transport?.last_error" class="text-crit"> · last error: {{ wb.status.transport.last_error }}</span>
       </p>
     </section>

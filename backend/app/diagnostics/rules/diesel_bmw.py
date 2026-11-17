@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from app.diagnostics.engine import AnalysisContext, SessionData
+from typing import Any
+
+from app.diagnostics.engine import WINDOW_S, AnalysisContext, SessionData, windows
 from app.models.domain import Evidence, Finding
 
 RPM, MAP, MAF, BARO, EGR_CMD, EGR_ERR = 0x0C, 0x0B, 0x10, 0x33, 0x2C, 0x2D
@@ -38,7 +40,13 @@ DPF_CODES = {
     "P246C",
 }
 
-EGR_ERR_SUSTAINED = 15.0  # % mean |EGR error| (PID 2D) treated as "sustained" - tool heuristic
+# Screening heuristics of this tool, NOT vehicle-specific pass/fail limits (none are published
+# for this ECU through generic OBD):
+EGR_ERR_SCREEN = 15.0  # % |EGR error| (PID 2D) worth a closer look
+EGR_MIN_SAMPLES = 20  # fewer good samples: no statement about the EGR error at all
+EGR_MIN_SPAN_S = 10.0  # shorter recording: no statement
+EGR_MIN_WINDOW_SAMPLES = 3  # a window/event needs at least this many samples to be evaluated
+EGR_LOW_RATE_HZ = 1.0  # below this, short transients can fall between samples
 KOEO_MAP_BARO_KPA = 5.0
 
 
@@ -56,6 +64,118 @@ def _support_line(sd: SessionData, pid: int, name: str) -> str:
         else "support unknown (no discovery data)"
     )
     return f"{name} (PID {pid:02X}): {state}."
+
+
+def summarize_egr_error(
+    series: list[tuple[float, float]], events: list[tuple[float, str]] | None = None
+) -> dict[str, Any]:
+    """Statistics of the generic EGR error PID that do not let +/- deviations cancel out.
+
+    -> {"enough": bool, "limitations": [...], plus n, span_s, rate_hz, signed_mean,
+    mean_abs, max_abs, windows (fixed WINDOW_S windows with mean |err| >= screen),
+    events (+/-WINDOW_S around each annotation)}. Uses measured samples only.
+    """
+    out: dict[str, Any] = {"enough": False, "limitations": [], "n": len(series)}
+    if not series:
+        out["limitations"].append("EGR error (PID 2D): no good samples in this session; not measured.")
+        return out
+    ts = [t for t, _ in series]
+    vals = [v for _, v in series]
+    span = max(ts) - min(ts)
+    rate = (len(series) - 1) / span if span > 0 else 0.0
+    out.update(n=len(vals), span_s=round(span, 2), rate_hz=round(rate, 3))
+    if len(vals) < EGR_MIN_SAMPLES or span < EGR_MIN_SPAN_S:
+        out["limitations"].append(
+            f"EGR error (PID 2D): only {len(vals)} samples over {span:.1f} s; at least {EGR_MIN_SAMPLES} samples "
+            f"over {EGR_MIN_SPAN_S:.0f} s are needed before this tool says anything about it."
+        )
+        return out
+    absv = [abs(v) for v in vals]
+    out.update(
+        enough=True,
+        signed_mean=round(sum(vals) / len(vals), 2),
+        mean_abs=round(sum(absv) / len(absv), 2),
+        max_abs=round(max(absv), 2),
+    )
+    if rate < EGR_LOW_RATE_HZ:
+        out["limitations"].append(
+            f"EGR error (PID 2D) was sampled at only {rate:.2f} Hz; deviations shorter than "
+            f"~{1 / rate if rate else 0:.0f} s can fall between samples and be missed."
+        )
+    flagged = []
+    for k, w in sorted(windows(series).items()):
+        if len(w) >= EGR_MIN_WINDOW_SAMPLES:
+            m = sum(abs(v) for v in w) / len(w)
+            if m >= EGR_ERR_SCREEN:
+                flagged.append(
+                    {
+                        "t_start": k * WINDOW_S,
+                        "t_end": (k + 1) * WINDOW_S,
+                        "n": len(w),
+                        "mean_abs": round(m, 2),
+                    }
+                )
+    out["windows"] = flagged
+    ev_out = []
+    for t_ev, label in events or []:
+        near = [abs(v) for t, v in series if abs(t - t_ev) <= WINDOW_S]
+        if len(near) >= EGR_MIN_WINDOW_SAMPLES:
+            ev_out.append(
+                {
+                    "t": round(t_ev, 2),
+                    "label": label,
+                    "n": len(near),
+                    "mean_abs": round(sum(near) / len(near), 2),
+                }
+            )
+        else:
+            ev_out.append({"t": round(t_ev, 2), "label": label, "n": len(near), "mean_abs": None})
+            out["limitations"].append(
+                f"EGR error around annotation '{label}' at {t_ev:.1f} s: only {len(near)} sample(s) within "
+                f"+/-{WINDOW_S:.0f} s; not evaluated."
+            )
+    out["events"] = ev_out
+    return out
+
+
+def egr_error_evidence(sd: SessionData) -> tuple[Evidence | None, bool, list[str]]:
+    """-> (evidence or None, counts as supporting, limitation lines)."""
+    events = [(t, a.label) for t, a in sd.annotation_times()]
+    st = summarize_egr_error(sd.series(EGR_ERR), events)
+    if not st["enough"]:
+        return None, False, st["limitations"]
+    flagged_events = [
+        e for e in st["events"] if e["mean_abs"] is not None and e["mean_abs"] >= EGR_ERR_SCREEN
+    ]
+    sustained = abs(st["signed_mean"]) >= EGR_ERR_SCREEN
+    intermittent = not sustained and (st["mean_abs"] >= EGR_ERR_SCREEN or bool(st["windows"]))
+    parts = [
+        f"Generic EGR error (PID 2D) over {st['n']} samples ({st['span_s']:.0f} s, {st['rate_hz']:.2f} Hz): "
+        f"signed mean {st['signed_mean']:+.1f} %, mean |error| {st['mean_abs']:.1f} %, max |error| {st['max_abs']:.1f} %."
+    ]
+    if sustained:
+        parts.append("The deviation is sustained in one direction.")
+    elif intermittent:
+        parts.append(
+            "Large deviations in both directions cancel in the signed mean: the error is intermittent/oscillating, "
+            f"with {len(st['windows'])} {WINDOW_S:.0f}-s window(s) at mean |error| >= {EGR_ERR_SCREEN:.0f} %."
+        )
+    if flagged_events:
+        parts.append(
+            "Around annotated events: "
+            + "; ".join(
+                f"'{e['label']}' at {e['t']:.0f} s mean |error| {e['mean_abs']:.1f} %" for e in flagged_events
+            )
+            + "."
+        )
+    values = {
+        k: st[k]
+        for k in ("n", "span_s", "rate_hz", "signed_mean", "mean_abs", "max_abs", "windows", "events")
+    }
+    values["egr_error_mean"] = st["signed_mean"]  # kept for existing exports/consumers
+    values["screen_threshold_pct"] = EGR_ERR_SCREEN
+    ev = Evidence(text=" ".join(parts), values=values)
+    return ev, sustained or intermittent or bool(flagged_events), st["limitations"]
 
 
 def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], list[str], bool, bool]:
@@ -94,14 +214,11 @@ def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], 
         )
 
     signal = False
-    err = [v for _, v in sd.series(EGR_ERR)]
-    if len(err) >= 20:
-        mean = sum(err) / len(err)
-        ev = Evidence(
-            text=f"Generic EGR error (PID 2D) averaged {mean:+.1f} % over {len(err)} samples.",
-            values={"egr_error_mean": round(mean, 2), "n": len(err)},
-        )
-        if abs(mean) >= EGR_ERR_SUSTAINED:
+    ev, egr_supports, limits = egr_error_evidence(sd)
+    if sd.supported(EGR_ERR) is not False:
+        cond.extend(limits)
+    if ev is not None:
+        if egr_supports:
             sup.append(ev)
             signal = True
         else:
@@ -181,6 +298,8 @@ def air_path_egr_maf(ctx: AnalysisContext) -> list[Finding]:
             "The generic EGR error PID is defined loosely and implemented differently between ECUs; the ECU variant of this car is unconfirmed.",
             "A generic DTC names a monitored system, not a failed part.",
             "No reference MAF value is asserted: the correct idle air mass depends on the engine variant and EGR state.",
+            f"The {EGR_ERR_SCREEN:.0f} % EGR-error level is a screening heuristic of this tool, not a BMW pass/fail threshold.",
+            "Signals are polled one after another, never at the same instant; values of different PIDs are not simultaneous.",
         ],
         next_steps=list(AIR_PATH_STEPS),
     )

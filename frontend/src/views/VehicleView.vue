@@ -18,16 +18,28 @@ function save() {
       <div class="grid gap-2 md:grid-cols-2" data-test="profile-cards">
         <button
           v-for="p in wb.profiles" :key="p.id" class="rounded-lg border p-3 text-left" :data-test="`profile-${p.id}`"
-          :class="p.id === wb.activeProfileId ? 'border-ink' : 'border-line'" :disabled="!!wb.recording" @click="wb.setProfile(p.id)"
+          :class="p.id === wb.activeProfileId ? 'border-ink' : 'border-line'"
+          :disabled="p.id !== wb.activeProfileId && !!wb.profileLockReason" @click="wb.setProfile(p.id)"
         >
           <div class="flex items-center justify-between gap-2">
             <span class="font-semibold">{{ p.name }}</span>
             <span class="badge">{{ p.id === wb.activeProfileId ? 'selected' : 'select' }}</span>
           </div>
           <div class="text-sm text-ink-2">{{ p.engine }} · expected protocol: {{ p.expected_protocol_families.map(famName).join(' / ') }}</div>
-          <div class="text-xs text-ink-2">Profile status: {{ p.status === 'complete' ? 'complete' : 'in progress (added incrementally)' }}</div>
+          <div class="mt-1 flex flex-wrap gap-1 text-xs" :data-test="`caps-${p.id}`">
+            <span class="badge" data-test="cap-generic">
+              Generic OBD: {{ p.capabilities.generic_obd === 'ready' ? 'ready' : 'in progress (added incrementally)' }}
+            </span>
+            <span class="badge" data-test="cap-manufacturer" :class="p.capabilities.manufacturer_diagnostics === 'available' ? '' : 'text-warn'">
+              Manufacturer {{ p.make === 'Porsche' ? 'DME' : 'DDE' }} data: {{ p.capabilities.manufacturer_diagnostics === 'available' ? 'available' : 'not read by this tool' }}
+            </span>
+            <span class="badge" data-test="cap-hardware" :class="p.capabilities.hardware_validated ? 'text-good' : 'text-warn'">
+              {{ p.capabilities.hardware_validated ? 'hardware-validated' : 'NOT hardware-validated (simulator only)' }}
+            </span>
+          </div>
         </button>
       </div>
+      <p v-if="wb.profileLockReason" class="mt-2 text-sm text-warn" data-test="profile-lock">{{ wb.profileLockReason }}</p>
     </section>
 
     <template v-if="wb.profile">
@@ -57,10 +69,14 @@ function save() {
 
       <section v-if="wb.vehicle" class="panel text-sm">
         <h2 class="h2">Owner-reported history (not measured by this tool)</h2>
+        <p class="text-ink-2" data-test="mfr-note">{{ wb.profile.capabilities.manufacturer_note }}</p>
         <p v-if="!wb.vehicle.owner_reported.symptoms.length && !wb.vehicle.owner_reported.repairs.length" class="text-ink-2">Nothing recorded for this vehicle.</p>
         <ul class="list-disc pl-5">
           <li v-for="s in wb.vehicle.owner_reported.symptoms" :key="s">Symptom: {{ s }}</li>
-          <li v-for="c in wb.vehicle.owner_reported.manufacturer_fault_codes" :key="c.code">{{ c.system }} fault {{ c.code }} ({{ c.source }})</li>
+          <li v-for="c in wb.vehicle.owner_reported.manufacturer_fault_codes" :key="c.code" data-test="owner-code">
+            {{ c.system }} fault {{ c.code }} ({{ c.source }})
+            <span class="badge text-warn">owner-reported history · not read from the car · needs a manufacturer-capable tester</span>
+          </li>
           <li v-for="r in wb.vehicle.owner_reported.repairs" :key="r.description">
             {{ r.description }}: {{ r.verified ? 'verified' : 'owner-reported, not independently verified' }}
           </li>

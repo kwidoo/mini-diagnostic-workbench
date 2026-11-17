@@ -405,6 +405,9 @@ class SimulatorTransport(Transport):
         if self.state != "connected":
             self.connect()
 
+    def _resync(self) -> None:
+        self.state = "disconnected"  # next _ensure_connected() is a fresh "connection"
+
     def _roundtrip(self, wire: bytes, timeout_s: float) -> tuple[bytes, str]:
         raw, delay = self.sim.handle(wire.decode("ascii").rstrip("\r"))
         drop = self.sim.scenario.drop_after_s
@@ -429,7 +432,11 @@ class FakeElmServer:
         port: int = 0,
         seed: int = 1,
         time_scale: float = 1.0,
+        script: Callable[[str, int, bytes], list[tuple[float, bytes]] | None] | None = None,
     ) -> None:
+        """``script(command, n, normal_response)`` may return ``[(delay_s, chunk), ...]`` to send
+        instead of the normal response (tests use it to inject late, partial or trailing bytes).
+        ``n`` counts commands across all connections, starting at 0."""
         sc = SCENARIOS[scenario] if isinstance(scenario, str) else scenario
         self.scenario = sc
         self.time_scale = time_scale
@@ -437,11 +444,16 @@ class FakeElmServer:
 
         self.sim = ElmSimulator(sc, clock=SystemClock(), seed=seed)
         self.connections = 0
+        self.script = script
+        self.log: list[tuple[int, str]] = []  # (connection number, command) in arrival order
+        self._log_lock = threading.Lock()
         outer = self
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
-                outer.connections += 1
+                with outer._log_lock:
+                    outer.connections += 1
+                    conn = outer.connections
                 sock: socket.socket = self.request
                 sock.settimeout(0.2)
                 opened = time.monotonic()
@@ -458,7 +470,20 @@ class FakeElmServer:
                     buf += chunk
                     while b"\r" in buf:
                         line, buf = buf.split(b"\r", 1)
-                        raw, delay = outer.sim.handle(line.decode("latin-1").strip())
+                        text = line.decode("latin-1").strip()
+                        with outer._log_lock:
+                            n = len(outer.log)
+                            outer.log.append((conn, text))
+                        raw, delay = outer.sim.handle(text)
+                        scripted = outer.script(text, n, raw) if outer.script else None
+                        if scripted is not None:
+                            try:
+                                for pause, part in scripted:
+                                    time.sleep(pause)
+                                    sock.sendall(part)
+                            except OSError:
+                                return
+                            continue
                         time.sleep(delay * outer.time_scale)
                         drop = sc.drop_after_s is not None and time.monotonic() - opened > sc.drop_after_s
                         try:

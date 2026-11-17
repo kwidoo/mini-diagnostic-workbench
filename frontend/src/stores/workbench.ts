@@ -42,6 +42,21 @@ export const useWorkbench = defineStore('workbench', {
     profile: (s): Profile | null => s.profiles.find((p) => p.id === s.activeProfileId) ?? null,
     connected: (s): boolean => !!s.status?.connected,
     recording: (s) => s.status?.recording ?? null,
+    /** Why switching to another vehicle profile is refused right now (mirrors the backend's 409 rules). */
+    profileLockReason: (s): string | null => {
+      const st = s.status
+      if (st?.recording) return 'Stop the recording before switching vehicle.'
+      if (st?.operation) return `Wait for the running ${st.operation} to finish before switching vehicle.`
+      if (st?.connected) return 'Disconnect before switching vehicle: the other vehicle must be probed on a fresh connection.'
+      return null
+    },
+    /** Why disconnect is refused right now: an operation must be stopped / finish first. */
+    disconnectLockReason: (s): string | null => {
+      const st = s.status
+      if (st?.recording) return 'Stop the recording first, then disconnect.'
+      if (st?.operation) return `Wait for the running ${st.operation} to finish, then disconnect.`
+      return null
+    },
     connectionState: (s): string => {
       if (!s.status) return 'unknown'
       if (s.status.connected) return 'connected'

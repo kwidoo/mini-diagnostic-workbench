@@ -32,7 +32,9 @@ class VehicleProfile:
     model: str
     engine: str
     fuel: str
-    status: str  # "complete" | "incremental"
+    # Scope of the *generic OBD* support only: "generic_obd_ready" | "generic_obd_incremental".
+    # It says nothing about manufacturer (DDE/DME) diagnostics, which this tool does not read.
+    status: str
     identity_note: str
     ecu_ids: tuple[str, ...]
     expected_protocol_families: tuple[str, ...]
@@ -43,6 +45,10 @@ class VehicleProfile:
     event_labels: tuple[str, ...]
     owner_reported: dict = field(default_factory=dict)
     first_run_checklist: tuple[str, ...] = ()
+    hardware_validated: bool = False  # only set after a real-vehicle protocol log has been verified
+    hardware_validation_note: str = (
+        "Not hardware-validated: tested against the synthetic ELM327 simulator only, not yet on this vehicle."
+    )
 
     def recording_profile(self, profile_id: str) -> RecordingProfile:
         for p in self.recording_profiles:
@@ -54,7 +60,21 @@ class VehicleProfile:
         d = asdict(self)
         d["ecus"] = [asdict(ECU_DEFINITIONS[e]) for e in self.ecu_ids]
         d["priority_pids"] = [{"pid": p, "hex": f"{p:02X}", "name": pid_name(p)} for p in self.priority_pids]
+        d["capabilities"] = self.capability_indicators()
         return d
+
+    def capability_indicators(self, manufacturer_enabled: bool = False) -> dict:
+        """Three separate indicators; never merged into one 'complete' flag."""
+        return {
+            "generic_obd": "ready" if self.status == "generic_obd_ready" else "incremental",
+            "manufacturer_diagnostics": "available" if manufacturer_enabled else "not_available",
+            "manufacturer_note": (
+                "Manufacturer-specific (BMW DDE / Bosch DME) fault memory and parameters are not read by this "
+                "tool; owner-reported manufacturer codes are history, not a reading."
+            ),
+            "hardware_validated": self.hardware_validated,
+            "hardware_validation_note": self.hardware_validation_note,
+        }
 
 
 RAIL = (0x23, 0x59, 0x22)
@@ -66,7 +86,7 @@ MINI_R60_DIESEL = VehicleProfile(
     model="Countryman (probably R60)",
     engine="2.0 diesel (variant unconfirmed, possibly Cooper SD)",
     fuel="diesel",
-    status="complete",
+    status="generic_obd_ready",
     identity_note=(
         "Owner-reported: 2016 MINI Countryman 2.0 diesel, probably R60, possibly Cooper SD with JCW styling. "
         "Platform, engine code and ECU variant are NOT confirmed until read from the car or vehicle documents."
@@ -163,7 +183,7 @@ PORSCHE_986 = VehicleProfile(
     model="Boxster 986 Mk2",
     engine="flat-six petrol (2.7 or 3.2 S, unconfirmed)",
     fuel="petrol",
-    status="incremental",
+    status="generic_obd_incremental",
     identity_note="Model year, engine size and DME variant are not confirmed until read from the car or vehicle documents.",
     ecu_ids=("bosch-me7-8-unconfirmed",),
     expected_protocol_families=("kline",),

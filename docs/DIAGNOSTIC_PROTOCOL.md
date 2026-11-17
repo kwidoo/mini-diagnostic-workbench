@@ -25,6 +25,40 @@ The protocol is read back, never assumed. CAN (6-9) and K-line (3-5) are decoded
 anything else stops with an explicit error. If the transport reconnects, the whole
 sequence runs again before the next request, because the adapter may have reset.
 
+Init answers are checked, not just logged: `ATZ` must answer with an `ELM` identity,
+`ATE0`/`ATH1`/`ATSP0` must answer exactly `OK`, `ATDPN` must be a protocol number. Any
+other answer means the reply stream is out of step with the requests (for example a
+late ECU answer read as the `ATZ` reply); init then fails and the connection is
+discarded.
+
+## Resynchronisation
+
+The ELM327 link has no request ids: the only way to pair a reply with its request is
+order. After an exchange that did not end cleanly with a `>` prompt, the position in
+the stream is unknown and a late reply could be read as the answer to the next request.
+The rules (backend/app/adapters/base.py, tcp.py, obd/client.py):
+
+| Event | Exchange status | Reading | What happens to the connection |
+|---|---|---|---|
+| no prompt before the deadline | `timeout` | `timeout`, no value | marked unsynchronised |
+| user/stop cancelled the request | `cancelled` | `timeout`, no value | marked unsynchronised |
+| partial reply, then nothing | `timeout` (raw partial bytes kept) | `timeout`, no value | marked unsynchronised |
+| TCP dropped mid-reply | `closed` (raw partial bytes kept) | `disconnected` | dropped |
+| bytes after the `>` prompt | `desync` (raw kept) | `error`, no value | marked unsynchronised |
+| bytes waiting *before* a request is sent | `desync` (stray bytes kept); request **not sent** | `error`, no value | marked unsynchronised |
+
+An unsynchronised connection is never reused. Before the next request the client
+(1) closes it and opens a new TCP connection, (2) runs the full init sequence above on
+the new connection, (3) only then sends the vehicle request. The transport refuses any
+vehicle (non-AT) request on a connection the adapter has not been re-initialised on
+(`TransportUnsyncedError`). A reply from an incomplete exchange is never decoded into a
+value, live or on replay. Regression tests: backend/tests/test_resync.py (real sockets
+against the fake ELM327, with the late reply arriving after the next request was sent).
+
+Not hardware-validated: whether a real Vgate adapter forwards a late ECU answer to a
+*new* TCP client is unknown. The `ATZ` identity check covers that case; the first real
+sessions should be checked for `desync` exchanges and the `resyncs` counter.
+
 ## Framing
 
 A response is everything up to the `>` prompt. The parser handles: command echo,
@@ -90,6 +124,11 @@ its own timestamp; nothing is interpolated or resampled for storage. Per-signal 
 (actual Hz, attempts, drops, error rate, latency mean / p95 / max, largest gap) are
 computed from what was stored. Analysis compares variability inside 5-second windows
 and says explicitly that this shows association in time, not order or cause.
+
+EGR error (PID 2D) is summarised with signed mean, mean |error|, max |error|, 5-s windows
+with large |error| and windows around user annotations, so +/- deviations cannot cancel.
+It needs at least 20 samples over 10 s; sampling below 1 Hz is reported as a limitation.
+The 15 % level is a screening heuristic of this tool, not a vehicle-specific threshold.
 
 ## Manufacturer-specific requests
 

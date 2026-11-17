@@ -14,8 +14,7 @@ from typing import Any
 
 from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame
 from app.obd.allowlist import AllowedCommand, ForbiddenRequestError
-from app.obd.client import DTC_MODES, interpret_dtcs, interpret_pid
-from app.obd.elm import decode_reply, parse_reply
+from app.obd.client import DTC_MODES, decode_exchange, interpret_dtcs, interpret_pid
 from app.parameters.standard_pids import BITMAP_PIDS
 from app.storage.db import Store
 
@@ -52,9 +51,7 @@ def transcript_lines(store: Store, sid: str, include_vin: bool = False) -> list[
 
 
 def _decode(ex: Exchange, family: str, is_29bit: bool | None):
-    reply = parse_reply(bytes.fromhex(ex.response_hex), ex.request, ex.status == "timeout")
-    msgs, problems = decode_reply(reply, family, is_29bit)
-    return ex, reply, msgs, problems
+    return decode_exchange(ex, family, is_29bit)  # same trust rules as live decoding
 
 
 def ingest_transcript(
