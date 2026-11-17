@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 from app import config
@@ -18,7 +22,7 @@ from app.service import BusyError, NotConnectedError, Workbench
 from app.storage.db import Store
 from app.storage.export import build_files, build_zip
 from app.storage.transcript import ingest_file
-from app.vehicles.profiles import PROFILES
+from app.vehicles.profiles import MONITORING_EVENT_IDS, PROFILES
 
 SAFETY = (
     "READ-ONLY tool. Test with the vehicle stationary, parked safely, outdoors or well ventilated.\n"
@@ -75,11 +79,30 @@ def build_parser() -> argparse.ArgumentParser:
     _connection_args(p)
     p.add_argument("--read-vin", action="store_true")
     p.add_argument("--label", default="")
-    p = sub.add_parser("record", help="record selected signals for a fixed duration")
+    p = sub.add_parser("record", help="record selected signals for a fixed duration, or until stopped")
     _connection_args(p)
-    p.add_argument("--duration", type=float, default=120.0)
+    p.add_argument("--duration", type=float, default=120.0, help="seconds (ignored with --until-stop)")
     p.add_argument(
-        "--profile", default="idle", help="recording profile of the active vehicle (idle, warmup, road)"
+        "--profile",
+        default="idle",
+        help="recording profile of the active vehicle (idle, warmup, road, mini_extended_monitoring)",
+    )
+    p.add_argument(
+        "--until-stop",
+        action="store_true",
+        help="record until Ctrl-C (or SIGTERM); the session is closed cleanly and kept",
+    )
+    p.add_argument(
+        "--max-duration", type=float, default=None, help="optional safety limit in seconds for --until-stop"
+    )
+    p.add_argument("--drive-type", choices=["city", "highway", "mixed", "other"], default=None)
+    p.add_argument(
+        "--resume-probe",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="opt-in: after the ECU stops answering, send one probe request this often (backs off). "
+        "Default: no vehicle request until the recording is stopped",
     )
     p.add_argument(
         "--pids", default=None, help="explicit comma-separated hex PIDs, e.g. 0C,10,0B (overrides --profile)"
@@ -97,10 +120,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("sessions", help="list stored sessions")
     p = sub.add_parser("analyze", help="evidence-based findings for a session")
     p.add_argument("--session", default="latest")
-    p = sub.add_parser("annotate", help="add an event marker to a session")
+    p = sub.add_parser(
+        "annotate", help="add an event marker to a session (also while another process records)"
+    )
     p.add_argument("--session", default="latest")
-    p.add_argument("--label", required=True)
+    p.add_argument("--label", default="")
+    p.add_argument(
+        "--event", choices=sorted(MONITORING_EVENT_IDS), default=None, help="predefined MINI monitoring event"
+    )
     p.add_argument("--note", default="")
+    p = sub.add_parser("monitoring", help="monitoring summary of a session (shutdowns, fan, voltage, DPF)")
+    p.add_argument("--session", default="latest")
+    p = sub.add_parser("drive-type", help="label a session as city / highway / mixed / other")
+    p.add_argument("--session", default="latest")
+    p.add_argument("type", choices=["city", "highway", "mixed", "other"])
     p = sub.add_parser("export", help="export a session")
     p.add_argument("--session", default="latest")
     p.add_argument("--format", choices=["zip", "json", "csv", "md", "jsonl"], default="zip")
@@ -187,12 +220,125 @@ def _print_findings(findings) -> None:
                 print(f"   {title:<15}: {i}")
 
 
+def _record_with_signals(wb: Workbench, a: argparse.Namespace, pids: list[int] | None) -> str:
+    """Run the recording in the foreground. First Ctrl-C / SIGTERM: stop cleanly (the session is
+    closed and kept). Second Ctrl-C: abort immediately (the session is still closed with what was saved)."""
+    presses = {"n": 0}
+
+    def on_signal(signum, frame) -> None:  # noqa: ARG001
+        presses["n"] += 1
+        if presses["n"] == 1:
+            print("\nstopping: closing the session ... (Ctrl-C again to abort now)", file=sys.stderr)
+            wb.stop_recording()
+        else:
+            raise KeyboardInterrupt
+
+    old = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    in_main = threading.current_thread() is threading.main_thread()
+    if in_main:
+        for sig in old:
+            signal.signal(sig, on_signal)
+    q = wb.hub.subscribe()
+    done = threading.Event()
+    printer = threading.Thread(target=_print_live_events, args=(q, done), daemon=True)
+    printer.start()
+    try:
+        return wb.record(
+            a.duration,
+            a.profile,
+            pids,
+            a.label,
+            not a.no_pre_scan,
+            not a.no_post_scan,
+            a.freeze_frame,
+            until_stop=a.until_stop,
+            max_duration_s=a.max_duration,
+            drive_type=a.drive_type,
+            resume_probe_s=a.resume_probe,
+        )
+    finally:
+        done.set()
+        wb.hub.unsubscribe(q)
+        if in_main:
+            for sig, handler in old.items():
+                signal.signal(sig, handler)
+
+
+def _print_live_events(q: queue.Queue, done: threading.Event) -> None:
+    """Timeline events and link-state changes on stderr while a recording runs."""
+    last_state = None
+    while not done.is_set():
+        try:
+            ev = q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if ev.get("type") == "annotation":
+            an = ev["annotation"]
+            stamp = time.strftime("%H:%M:%S", time.localtime(an["t_wall"]))
+            print(f"[{stamp}] {an['origin']:<8} {an['label']}: {an['note']}", file=sys.stderr)
+        elif ev.get("type") == "monitor" and ev["monitor"].get("state") != last_state:
+            last_state = ev["monitor"].get("state")
+            print(
+                f"[link] {last_state}; intervals {ev['monitor'].get('effective_intervals')}", file=sys.stderr
+            )
+
+
+def _print_monitoring(m: dict) -> None:
+    def t(x):
+        return "n/a" if x is None else f"{x:.0f}s"
+
+    print(f"session {m['session_id']}" + ("  [SYNTHETIC DATA]" if m["synthetic"] else ""))
+    d = m["drive"]
+    print(
+        f"drive: running {d['running_s'] / 60:.1f} min, max {d['max_speed_kmh']} km/h, "
+        f"label {d['drive_type_user_label'] or '-'}"
+    )
+    print("signals:")
+    for s in m["signals"]:
+        print(f"  {s['hex']:<5}{s['name'][:46]:<48}{s['tier'] or '-':<7}{s['provenance']:<8}{s['status']}")
+    print("engine stops:")
+    for st in m["shutdowns"]:
+        print(f"  {t(st['t_rel_s'])}: {st['origin']} ({st['basis']})")
+    print("fan runs (manual markers):")
+    for f in m["fan"]["runs"]:
+        dur = f"{f['duration_s']:.0f}s" if f["duration_s"] is not None else "end not marked"
+        print(
+            f"  {t(f['t_start_rel_s'])}: {dur}"
+            + (f", {f['seconds_after_shutdown']:.0f}s after stop" if f["after_shutdown"] else "")
+        )
+    for key in ("ecu", "adapter"):
+        v = m["voltage"][key]
+        if v["status"] == "measured":
+            run = v["engine_running"] or {}
+            print(
+                f"voltage {key}: start {v['at_start']['value']} V, running median {run.get('median')} V, drops {len(v['drops'])}"
+            )
+        else:
+            print(f"voltage {key}: not measured")
+    print("DPF:")
+    for g in m["dpf"]["availability"]:
+        if g["group"] == "wanted":
+            for i in g["items"]:
+                print(f"  {i['name']}: {i['status']}")
+    for r in m["detected_events"]:
+        print(f"detected ({r['origin']}, {r['status']}, {r['confidence']}): {r['text']}")
+    for line in m["dpf"]["limitations"] + m["coolant"].get("limitations", []):
+        print(f"limitation: {line}")
+    for e in m["link"]:
+        print(f"link {t(e['t_rel_s'])}: {e['type']}")
+
+
 def main(argv: list[str] | None = None) -> int:
     a = build_parser().parse_args(argv)
     store = Store(a.db or config.db_path())
     wb = Workbench(store)
     if a.vehicle:
         wb.set_profile(a.vehicle)
+    if a.cmd not in ("simulate", "fixtures", "profiles"):
+        for sid in wb.recover_interrupted():
+            print(
+                f"note: session {sid} was left open by an interrupted run; closed, data kept", file=sys.stderr
+            )
     try:
         return _run(a, store, wb)
     except (
@@ -296,25 +442,22 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
         _connect(wb, a)
         pids = [int(x, 16) for x in a.pids.split(",")] if a.pids else None
         plan = wb.plan_recording(a.profile, pids)
-        print(
-            "recording: "
-            + ", ".join(
-                f"{p:02X} {PIDS[p].name if p in PIDS else pid_name(p)}" for p in plan["fast"] + plan["slow"]
-            ),
-            file=sys.stderr,
-        )
+        tiers = [k for k in ("fast", "medium", "slow") if plan.get(k)]
+        for k in tiers:
+            print(
+                f"recording ({k}): "
+                + ", ".join(f"{p:02X} {PIDS[p].name if p in PIDS else pid_name(p)}" for p in plan[k]),
+                file=sys.stderr,
+            )
         if plan["unsupported"]:
             print(
                 "not supported, skipped: " + ", ".join(f"{p:02X} {pid_name(p)}" for p in plan["unsupported"]),
                 file=sys.stderr,
             )
-        try:
-            sid = wb.record(
-                a.duration, a.profile, pids, a.label, not a.no_pre_scan, not a.no_post_scan, a.freeze_frame
-            )
-        except KeyboardInterrupt:
-            wb.stop_recording()
-            raise
+        if a.until_stop:
+            limit = f" (safety limit {a.max_duration:.0f} s)" if a.max_duration else ""
+            print(f"recording until stopped{limit}: press Ctrl-C to stop and save", file=sys.stderr)
+        sid = _record_with_signals(wb, a, pids)
         s = store.get_session(sid)
         if a.json:
             print(
@@ -328,11 +471,31 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             f"session {sid}"
             + (f"  (ended early: {s['meta']['aborted']})" if s["meta"].get("aborted") else "")
         )
-        print(f"  {'PID':<4}{'signal':<50}{'Hz':>7}{'ok':>6}{'drop':>6}{'lat ms':>8}{'max gap s':>11}")
+        if s["meta"].get("post_scan_skipped"):
+            print(f"  post-scan skipped: {s['meta']['post_scan_skipped']}")
+        print(f"  {'PID':<5}{'signal':<49}{'Hz':>7}{'ok':>6}{'drop':>6}{'lat ms':>8}{'max gap s':>11}")
         for m in s["meta"]["metrics"]:
+            hexid = "ATRV" if m.get("mode", 1) == 0 else f"{m['pid']:02X}"
             print(
-                f"  {m['pid']:02X}  {m['name']:<50}{m['actual_hz']:>7}{m['ok']:>6}{m['dropped']:>6}{m['latency_ms_mean'] or 0:>8}{m['max_gap_s'] or 0:>11}"
+                f"  {hexid:<5}{m['name'][:47]:<49}{m['actual_hz']:>7}{m['ok']:>6}{m['dropped']:>6}{m['latency_ms_mean'] or 0:>8}{m['max_gap_s'] or 0:>11}"
             )
+        return 0
+
+    if a.cmd == "monitoring":
+        from app.diagnostics.monitoring import summary_for
+
+        sid = _resolve(store, a.session)
+        m = summary_for(store, sid)
+        if a.json:
+            print(json.dumps(m, indent=2, default=str))
+            return 0
+        _print_monitoring(m)
+        return 0
+
+    if a.cmd == "drive-type":
+        sid = _resolve(store, a.session)
+        wb.set_drive_type(sid, a.type)
+        print(f"{sid}: drive type {a.type}")
         return 0
 
     if a.cmd == "replay":
@@ -349,8 +512,12 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
         if a.json:
             print(json.dumps(rows, indent=2))
         for s in [] if a.json else rows:
+            open_ = "" if s["ended_at"] else "  [OPEN]"
+            dt = (s["meta"].get("user_labels") or {}).get("drive_type")
             print(
                 f"{s['id']}  {s['kind']:<8} {s['source']:<9} {'SYNTHETIC' if s['synthetic'] else 'real':<9} {s['vehicle_profile']:<28} {s['label']}"
+                + (f" ({dt})" if dt else "")
+                + open_
             )
         return 0
 
@@ -367,8 +534,8 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
 
     if a.cmd == "annotate":
         sid = _resolve(store, a.session)
-        wb.annotate(sid, a.label, a.note)
-        print(f"marker added to {sid}")
+        ann = wb.annotate(sid, a.label, a.note, a.event)
+        print(f"marker '{ann.label}' added to {sid}")
         return 0
 
     if a.cmd == "export":

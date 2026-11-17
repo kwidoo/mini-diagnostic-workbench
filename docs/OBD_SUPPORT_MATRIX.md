@@ -101,6 +101,15 @@ to DPF or EGR data and needs no manufacturer protocol.
   project [5] could not be retrieved (robots exclusion), and BMW code texts differ by
   DDE variant, so the tool does not attach a description to it.
 
+## Continuous monitoring (mini_extended_monitoring)
+
+See MONITORING.md. Newly recorded: adapter supply voltage via ATRV during recordings
+(adapter-measured, kept separate from ECU voltage PID 42), observed engine start/stop
+and MIL transitions, adapter link and ECU-silence events, manual fan / battery /
+regeneration markers. Still unavailable: every DPF state, soot, ash, regeneration
+history and fan value listed above. Possible regenerations are a heuristic and are
+never reported as confirmed.
+
 ## Sources
 
 1. Vgate iCar Pro Wi-Fi quick start guide, https://manualmachine.com/vgate/icarprowifi/17897015-quick-start-guide/

@@ -195,6 +195,19 @@ RAW_ONLY_PIDS: dict[int, str] = {
 }
 
 
+#: Adapter-measured signals are stored with mode 0 ("not an OBD service"). Their provenance is the
+#: adapter itself, never the ECU: ATRV is the supply voltage at OBD pin 16 as the adapter measures it.
+ADAPTER_MODE = 0
+ADAPTER_VOLTAGE_PID = 0x00
+ADAPTER_VOLTAGE_NAME = "Adapter supply voltage (ATRV, measured by the adapter)"
+
+
+def signal_name(mode: int, pid: int) -> str:
+    if mode == ADAPTER_MODE and pid == ADAPTER_VOLTAGE_PID:
+        return ADAPTER_VOLTAGE_NAME
+    return pid_name(pid)
+
+
 def pid_name(pid: int) -> str:
     if pid in PIDS:
         return PIDS[pid].name

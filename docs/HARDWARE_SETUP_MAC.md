@@ -71,6 +71,12 @@ protocol, ECU headers and date in docs/VEHICLE_PROFILES.md. Only then may a prof
 For the Porsche K-line path this requires a real 986 response; until then it stays
 hardware-unvalidated even if the MINI has been validated.
 
+## First extended (continuous) recording
+
+After steps 1-4 above have been checked, follow "First extended recording on the car"
+in MONITORING.md (`mini-obd record --profile mini_extended_monitoring --until-stop`).
+It uses no request beyond the list above plus the PIDs the ECU advertises.
+
 ## Troubleshooting
 
 | Message | Meaning | What to do |

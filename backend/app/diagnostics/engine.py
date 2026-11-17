@@ -65,7 +65,10 @@ class SessionData:
         return self._series[pid]
 
     def metric(self, pid: int) -> dict[str, Any] | None:
-        return next((m for m in self.session["meta"].get("metrics", []) if m["pid"] == pid), None)
+        return next(
+            (m for m in self.session["meta"].get("metrics", []) if m["pid"] == pid and m.get("mode", 1) == 1),
+            None,
+        )
 
     def dtc_codes(self) -> set[str]:
         return {d.code for sc in self.scans for d in sc.dtcs}
@@ -74,8 +77,13 @@ class SessionData:
         return [sc.mil_on for sc in self.scans if sc.mil_on is not None]
 
     def annotation_times(self) -> list[tuple[float, Annotation]]:
+        """User markers on the recording timebase (observed/inferred timeline events excluded)."""
         t0 = self.t0
-        return [(a.t_mono - t0, a) for a in self.annotations if a.t_mono is not None and t0 is not None]
+        return [
+            (a.t_mono - t0, a)
+            for a in self.annotations
+            if a.t_mono is not None and t0 is not None and a.origin == "manual"
+        ]
 
 
 @dataclass

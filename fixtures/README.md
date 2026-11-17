@@ -17,6 +17,7 @@ from them are labelled SYNTHETIC everywhere.
 | slow-adapter.jsonl | MINI | 250-600 ms responses, low sample rate |
 | porsche-healthy-idle.jsonl | Porsche | petrol flat-six over K-line (ISO 9141-2) |
 | porsche-bank-imbalance.jsonl | Porsche | diverging long-term fuel trims, pending P0174 |
+| mini-monitoring-shutdown-fan.jsonl | MINI | `mini_extended_monitoring`: idle, engine stop, ECU goes silent, adapter voltage only; manual fan_running / ignition_off / fan_stopped markers |
 
 Format: `mini-obd-transcript/1` (see docs/ARCHITECTURE.md). Replay with
 `mini-obd replay fixtures/rough-idle.jsonl`. A real session exported from the tool

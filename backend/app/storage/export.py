@@ -13,7 +13,9 @@ import time
 import zipfile
 from typing import Any
 
+from app.acquisition.recorder import GOOD
 from app.diagnostics.engine import analyze_session
+from app.diagnostics.monitoring import is_monitoring_session, summary_for
 from app.models.domain import Finding
 from app.storage.db import Store
 from app.storage.transcript import REDACTED, transcript_lines
@@ -57,7 +59,80 @@ _LINK_COUNTERS = [
 ]
 
 
-def render_report(session: dict[str, Any], scans: list, annotations: list, findings: list[Finding]) -> str:
+def render_monitoring(m: dict[str, Any]) -> list[str]:
+    """Report section for continuous-monitoring sessions (appended; other reports are unchanged)."""
+
+    def t(x: float | None) -> str:
+        return "n/a" if x is None else f"{x:.0f} s"
+
+    out = [
+        "## Continuous monitoring",
+        "",
+        "Origins: **measured** (ECU / adapter value), **observed** (transition seen in measured data), "
+        "**manual** (marked by a person), **inferred** (heuristic: always 'possible', never confirmed), "
+        "**not available** (not offered by the ECU or manufacturer-only).",
+        "",
+        "### Signals",
+        "",
+        "| Signal | Tier | Provenance | Status | ok / raw / failed |",
+        "|---|---|---|---|---|",
+    ]
+    for s in m["signals"]:
+        out.append(
+            f"| {s['name']} ({s['hex']}) | {s['tier'] or '-'} | {s['provenance']} | {s['status']} | "
+            f"{s['ok']} / {s['raw']} / {s['failed']} |"
+        )
+    out += ["", "### Engine stops and fan", ""]
+    if not m["shutdowns"]:
+        out.append("- No engine stop recorded.")
+    for st in m["shutdowns"]:
+        out.append(f"- Engine stop at {t(st['t_rel_s'])} ({st['origin']}: {st['basis']})")
+    for f in m["fan"]["runs"]:
+        dur = f"{f['duration_s']:.0f} s" if f["duration_s"] is not None else "end not marked"
+        rel = f", {f['seconds_after_shutdown']:.0f} s after an engine stop" if f["after_shutdown"] else ""
+        out.append(f"- Fan run (manual markers) at {t(f['t_start_rel_s'])}: {dur}{rel}")
+    out += ["", "### Voltage", "", f"_{m['voltage']['caveat']}_", ""]
+    for key in ("ecu", "adapter"):
+        v = m["voltage"][key]
+        if v["status"] != "measured":
+            out.append(f"- {v['provenance']}: not measured")
+            continue
+        run = v["engine_running"] or {}
+        out.append(
+            f"- {v['provenance']}: start {v['at_start']['value']} V; running median {run.get('median', 'n/a')} V "
+            f"(min {run.get('min', 'n/a')}); large drops outside engine start/stop: "
+            f"{sum(1 for d in v['drops'] if d['context'] is None)}"
+        )
+    for w in m["voltage"]["battery_warnings"]:
+        out.append(f"- '{w['event']}' at {t(w['t_rel_s'])} ({w['origin']}); nearby: {w['nearby']}")
+    out += ["", "### DPF", ""]
+    for g in m["dpf"]["availability"]:
+        if g["group"] == "wanted":
+            out += [f"- {i['name']}: **{i['status'].replace('_', ' ')}** ({i['via']})" for i in g["items"]]
+    for r in m["dpf"]["possible_regenerations"] + m["dpf"]["possible_interrupted_regenerations"]:
+        out.append(f"- *{r['type']}* ({r['confidence']} confidence, inferred): {r['text']}")
+    out += [f"- {x}" for x in m["dpf"]["limitations"]]
+    out += ["", "### Link and sampling", ""]
+    for e in m["link"]:
+        out.append(f"- {t(e['t_rel_s'])}: {e['type']}" + (f" (gap {e['gap_s']} s)" if e["gap_s"] else ""))
+    s = m["sampling"]
+    out.append(
+        f"- Base intervals {s['base_intervals']}; effective at the end {s['final_effective_intervals']}; "
+        f"{len(s['adjustments'])} adjustment(s) to adapter throughput."
+    )
+    oc = m.get("observed_capabilities")
+    if oc:
+        out.append(f"- Observed in this session (not assumed): {oc}")
+    return out + [""]
+
+
+def render_report(
+    session: dict[str, Any],
+    scans: list,
+    annotations: list,
+    findings: list[Finding],
+    monitoring: dict[str, Any] | None = None,
+) -> str:
     prof = get_profile(session["vehicle_profile"])
     meta = session["meta"]
     out: list[str] = [f"# Diagnostic session report: {session['id']}", ""]
@@ -133,9 +208,16 @@ def render_report(session: dict[str, Any], scans: list, annotations: list, findi
     if annotations:
         out += (
             ["## Event markers", ""]
-            + [f"- {_iso(a.t_wall)}: {a.label}" + (f" - {a.note}" if a.note else "") for a in annotations]
+            + [
+                f"- {_iso(a.t_wall)}: {a.label}"
+                + (f" [{a.origin}]" if a.origin != "manual" else "")
+                + (f" - {a.note}" if a.note else "")
+                for a in annotations
+            ]
             + [""]
         )
+    if monitoring is not None:
+        out += render_monitoring(monitoring)
     out += [
         "## Findings",
         "",
@@ -173,11 +255,17 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
     vin = (session["meta"].get("vehicle_info") or {}).get("vin")
     dump = lambda o: json.dumps(o, indent=2, sort_keys=True, ensure_ascii=False) + "\n"  # noqa: E731
 
+    monitoring = summary_for(store, sid) if is_monitoring_session(session) else None
     ann_buf = io.StringIO()
     w = csv.writer(ann_buf, lineterminator="\n")
-    w.writerow(["t_wall", "t_mono", "label", "note"])
+    # the original four columns first; event columns only when a session has typed events
+    typed = any(a.event_type or a.origin != "manual" for a in annotations)
+    w.writerow(
+        ["t_wall", "t_mono", "label", "note"] + (["event_type", "origin", "confidence"] if typed else [])
+    )
     for a in annotations:
-        w.writerow([a.t_wall, "" if a.t_mono is None else a.t_mono, a.label, a.note])
+        row = [a.t_wall, "" if a.t_mono is None else a.t_mono, a.label, a.note]
+        w.writerow(row + ([a.event_type or "", a.origin, a.confidence or ""] if typed else []))
 
     files = {
         "README.txt": (
@@ -199,8 +287,45 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
         "annotations.csv": ann_buf.getvalue(),
         "transcript.jsonl": "\n".join(transcript_lines(store, sid, include_vin)) + "\n",
         "findings.json": dump([f.model_dump() for f in findings]),
-        "report.md": render_report(session, scans, annotations, findings),
+        "report.md": render_report(session, scans, annotations, findings, monitoring),
     }
+    if monitoring is not None:
+        prof = get_profile(session["vehicle_profile"])
+        meta = session["meta"]
+        files["README.txt"] += (
+            "\ncontinuous-monitoring files:\n"
+            "monitoring.json        full monitoring summary (shutdowns, fan runs, voltage, coolant, DPF, link)\n"
+            "events.jsonl           every timeline event: manual, observed and link events with origin/evidence\n"
+            "detected_events.json   inferred diagnostic events (always 'possible', never confirmed)\n"
+            "sampling_quality.json  tiers, effective intervals, adjustments and per-signal rates\n"
+            "failed_samples.jsonl   every failed read attempt (no value, reason kept)\n"
+            "capabilities.json      adapter, ECU capabilities, requested/unsupported signals\n"
+            "vehicle_profile.json   the vehicle profile the session was recorded with\n"
+        )
+        files.update(
+            {
+                "monitoring.json": dump(monitoring),
+                "events.jsonl": "".join(
+                    json.dumps(a.model_dump(), sort_keys=True, ensure_ascii=False) + "\n" for a in annotations
+                ),
+                "detected_events.json": dump(monitoring["detected_events"]),
+                "sampling_quality.json": dump(
+                    {**monitoring["sampling"], "signal_status": monitoring["signals"]}
+                ),
+                "failed_samples.jsonl": "".join(
+                    json.dumps(s_, sort_keys=True) + "\n" for s_ in samples if s_["quality"] not in GOOD
+                ),
+                "capabilities.json": dump(
+                    {
+                        "adapter": meta.get("adapter"),
+                        "capabilities": meta.get("capabilities"),
+                        "selected": meta.get("selected"),
+                        "sampling_plan": meta.get("sampling_plan"),
+                    }
+                ),
+                "vehicle_profile.json": dump(prof.to_dict()),
+            }
+        )
     if vin and not include_vin:
         files = {k: v.replace(vin, REDACTED) for k, v in files.items()}
     return files

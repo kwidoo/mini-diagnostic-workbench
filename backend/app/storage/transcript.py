@@ -14,11 +14,29 @@ from typing import Any
 
 from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame
 from app.obd.allowlist import AllowedCommand, ForbiddenRequestError
-from app.obd.client import DTC_MODES, decode_exchange, interpret_dtcs, interpret_pid
+from app.obd.client import (
+    DTC_MODES,
+    decode_exchange,
+    interpret_adapter_voltage,
+    interpret_dtcs,
+    interpret_pid,
+)
 from app.parameters.standard_pids import BITMAP_PIDS
 from app.storage.db import Store
 
 FORMAT = "mini-obd-transcript/1"
+RECORDING_META_KEYS = (
+    "recording_profile",
+    "selected",
+    "sampling_plan",
+    "until_stop",
+    "max_duration_s",
+    "requested_duration_s",
+    "user_labels",
+    "monitoring",
+    "post_scan_skipped",
+    "aborted",
+)
 REDACTED = "[REDACTED]"
 
 
@@ -41,6 +59,11 @@ def transcript_lines(store: Store, sid: str, include_vin: bool = False) -> list[
         if session["synthetic"]
         else "recorded from a real adapter",
     }
+    # recording context (optional key, newer transcripts): lets a replay of a monitoring
+    # recording be analysed exactly like the original session
+    rec = {k: meta[k] for k in RECORDING_META_KEYS if k in meta}
+    if rec:
+        header["recording"] = rec
     lines = [json.dumps(header, sort_keys=True)]
     for ex in store.exchanges(sid):
         if ex["request"] == "0902" and not include_vin:
@@ -90,6 +113,8 @@ def ingest_transcript(
             skipped.append(ex.request)  # nothing is ever sent during replay; just not interpreted
             continue
         if cmd.is_at:
+            if cmd.text == "ATRV" and ex.phase == "record":
+                samples.append(interpret_adapter_voltage(ex))  # adapter-measured, mode 0
             continue
         mode, pid = cmd.mode, cmd.pid
         decoded = _decode(ex, family, is_29bit)
@@ -139,6 +164,7 @@ def ingest_transcript(
         "scenario": header.get("scenario"),
         "replayed_from_kind": header.get("kind"),
         "replay_skipped_requests": skipped,
+        **(header.get("recording") or {}),
     }
     sid = store.create_session(
         kind=header.get("kind") or "record",

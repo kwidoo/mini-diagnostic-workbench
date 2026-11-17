@@ -17,11 +17,34 @@ PidOrGroup = int | tuple[int, ...]  # a tuple means "first one the ECU supports"
 
 
 @dataclass(frozen=True)
+class SamplingTiers:
+    """Initial target interval per priority tier (seconds between reads of ONE signal).
+
+    These are starting points: the monitoring recorder stretches them when the
+    adapter cannot keep up and reports the effective intervals it actually used.
+    """
+
+    fast_s: float = 0.5
+    medium_s: float = 2.0
+    slow_s: float = 10.0
+
+    def as_dict(self) -> dict[str, float]:
+        return {"fast": self.fast_s, "medium": self.medium_s, "slow": self.slow_s}
+
+
+@dataclass(frozen=True)
 class RecordingProfile:
     id: str
     name: str
-    fast: tuple[PidOrGroup, ...]  # polled every cycle
-    slow: tuple[PidOrGroup, ...] = ()  # one of these per cycle, rotating
+    fast: tuple[PidOrGroup, ...]  # legacy: polled every cycle; tiered: fast tier
+    slow: tuple[PidOrGroup, ...] = ()  # legacy: one of these per cycle, rotating; tiered: slow tier
+    medium: tuple[PidOrGroup, ...] = ()  # tiered profiles only
+    # None: the original round-robin recorder (unchanged). Set: deadline-scheduled tiers
+    # with adaptive intervals (app.acquisition.monitor).
+    tiers: SamplingTiers | None = None
+    adapter_voltage: bool = False  # also read the adapter supply voltage (ATRV) in the slow tier
+    monitoring: bool = False  # continuous monitoring: link/ECU events, engine-shutdown workflow
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,6 +68,8 @@ class VehicleProfile:
     event_labels: tuple[str, ...]
     owner_reported: dict = field(default_factory=dict)
     first_run_checklist: tuple[str, ...] = ()
+    # predefined timeline events (id, button label, hint) offered for monitoring recordings
+    monitoring_events: tuple[tuple[str, str, str], ...] = ()
     hardware_validated: bool = False  # only set after a real-vehicle protocol log has been verified
     hardware_validation_note: str = (
         "Not hardware-validated: tested against the synthetic ELM327 simulator only, not yet on this vehicle."
@@ -61,6 +86,7 @@ class VehicleProfile:
         d["ecus"] = [asdict(ECU_DEFINITIONS[e]) for e in self.ecu_ids]
         d["priority_pids"] = [{"pid": p, "hex": f"{p:02X}", "name": pid_name(p)} for p in self.priority_pids]
         d["capabilities"] = self.capability_indicators()
+        d["monitoring_events"] = [{"id": i, "label": lbl, "hint": h} for i, lbl, h in self.monitoring_events]
         return d
 
     def capability_indicators(self, manufacturer_enabled: bool = False) -> dict:
@@ -78,6 +104,52 @@ class VehicleProfile:
 
 
 RAIL = (0x23, 0x59, 0x22)
+
+#: Standard (SAE J1979) PIDs related to the exhaust aftertreatment / DPF. All are raw-only in
+#: this tool (layouts not verified); they are polled only when the ECU advertises them.
+DPF_STANDARD_PIDS = (0x7A, 0x7B, 0x7C, 0x78, 0x79, 0x73, 0x8B, 0x86)
+
+MINI_MONITORING_EVENTS: tuple[tuple[str, str, str], ...] = (
+    ("engine_started", "Engine started", "also detected automatically from RPM when the ECU answers"),
+    ("engine_stopped", "Engine stopped", "also detected automatically from RPM when the ECU answers"),
+    ("ignition_off", "Ignition off", "manual only: loss of ECU communication is not proof of ignition off"),
+    ("fan_running", "Fan running", "you hear the radiator fan (also after the engine is off)"),
+    ("fan_stopped", "Fan stopped", "the radiator fan has stopped"),
+    ("fan_unusually_loud", "Fan unusually loud", ""),
+    ("battery_warning", "Battery warning", "low-battery / charge warning shown in the car"),
+    (
+        "battery_warning_cleared",
+        "Battery warning gone",
+        "the warning went off by itself (nothing is cleared by this tool)",
+    ),
+    (
+        "suspected_dpf_regeneration",
+        "Suspected DPF regen (marker)",
+        "your own impression (smell, idle, fan); marks it, never triggers anything",
+    ),
+    ("mil_on", "MIL on", "also detected automatically from PID 01 when supported"),
+    ("mil_off", "MIL off", ""),
+    ("rough_idle", "Rough idle", ""),
+    ("power_loss", "Power loss", ""),
+    ("unusual_engine_noise", "Unusual engine noise", ""),
+)
+MONITORING_EVENT_IDS = frozenset(e[0] for e in MINI_MONITORING_EVENTS)
+
+MINI_EXTENDED_MONITORING = RecordingProfile(
+    "mini_extended_monitoring",
+    "MINI extended monitoring (continuous: DPF, cooling, battery, driving)",
+    fast=(0x0C, 0x0D, 0x04, 0x10, 0x0B),
+    medium=(0x05, 0x42, 0x2C, 0x2D, 0x0F, RAIL, 0x1F),
+    slow=(0x01, 0x33, 0x46, 0x5C, 0x69, 0x6B, *DPF_STANDARD_PIDS),
+    tiers=SamplingTiers(),
+    adapter_voltage=True,
+    monitoring=True,
+    description=(
+        "Runs until stopped. Fast: RPM, speed, load, MAF, MAP. Medium: coolant, ECU voltage, EGR, intake air, "
+        "rail pressure, run time. Slow: MIL status, ambient/baro/oil, extended EGR and DPF/exhaust PIDs (raw only), "
+        "adapter supply voltage. Only signals the ECU advertises are polled."
+    ),
+)
 
 MINI_R60_DIESEL = VehicleProfile(
     id="mini-countryman-r60-diesel",
@@ -127,6 +199,7 @@ MINI_R60_DIESEL = VehicleProfile(
             (0x0C, 0x0D, 0x10, 0x0B, 0x04),
             (RAIL, 0x05, 0x11, 0x2C, 0x2D, 0x33, 0x01),
         ),
+        MINI_EXTENDED_MONITORING,
     ),
     rule_ids=(
         "idle_rpm_stability",
@@ -136,6 +209,11 @@ MINI_R60_DIESEL = VehicleProfile(
         "intermittent_progression",
         "repair_history",
         "manufacturer_data_availability",
+        # monitoring rules return nothing for sessions that are not monitoring recordings
+        "monitoring_dpf_regeneration",
+        "monitoring_cooling",
+        "monitoring_electrical",
+        "monitoring_shutdown_fan",
     ),
     event_labels=(
         "rough idle started",
@@ -174,6 +252,7 @@ MINI_R60_DIESEL = VehicleProfile(
         "Start the engine only if it is safe; mini-obd record --duration 300 --profile idle, and mark events in the UI.",
         "Stop immediately on metallic knocking, overheating, exhaust/coolant smell or a flashing MIL.",
     ),
+    monitoring_events=MINI_MONITORING_EVENTS,
 )
 
 PORSCHE_986 = VehicleProfile(
@@ -258,3 +337,21 @@ def resolve_schedule(
     fast, m1 = pick(profile.fast)
     slow, m2 = pick(profile.slow)
     return fast, [p for p in slow if p not in fast], m1 + m2
+
+
+def resolve_tiers(profile: RecordingProfile, supported: set[int]) -> dict[str, list[int]]:
+    """Tiered profiles: -> {"fast", "medium", "slow", "unsupported"}. A PID appears in one tier only
+    (the fastest that lists it); unsupported PIDs are never polled."""
+    out: dict[str, list[int]] = {"fast": [], "medium": [], "slow": [], "unsupported": []}
+    seen: set[int] = set()
+    for tier in ("fast", "medium", "slow"):
+        for item in getattr(profile, tier):
+            group = item if isinstance(item, tuple) else (item,)
+            hit = next((p for p in group if p in supported), None)
+            if hit is None:
+                if group[0] not in out["unsupported"]:
+                    out["unsupported"].append(group[0])
+            elif hit not in seen:
+                seen.add(hit)
+                out[tier].append(hit)
+    return out

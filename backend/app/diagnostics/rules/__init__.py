@@ -8,6 +8,12 @@ from app.diagnostics.rules.generic import (
     manufacturer_data_availability,
     repair_history,
 )
+from app.diagnostics.rules.monitoring import (
+    monitoring_cooling,
+    monitoring_dpf_regeneration,
+    monitoring_electrical,
+    monitoring_shutdown_fan,
+)
 
 RULES = {
     "idle_rpm_stability": idle_rpm_stability,
@@ -18,4 +24,8 @@ RULES = {
     "air_path_egr_maf": air_path_egr_maf,
     "dpf_480a": dpf_480a,
     "dde_4862": dde_4862,
+    "monitoring_dpf_regeneration": monitoring_dpf_regeneration,
+    "monitoring_cooling": monitoring_cooling,
+    "monitoring_electrical": monitoring_electrical,
+    "monitoring_shutdown_fan": monitoring_shutdown_fan,
 }

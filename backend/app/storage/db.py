@@ -69,6 +69,15 @@ _EX_COLS = (
 )
 
 
+#: columns added after the first release (session events with origin and evidence)
+_ANNOTATION_EXTRA = {
+    "event_type": "TEXT",
+    "origin": "TEXT NOT NULL DEFAULT 'manual'",
+    "confidence": "TEXT",
+    "evidence": "TEXT NOT NULL DEFAULT '{}'",
+}
+
+
 def new_session_id(t_wall: float | None = None) -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime(t_wall or time.time())) + "-" + secrets.token_hex(2)
 
@@ -84,6 +93,16 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive, idempotent schema changes. Existing rows keep their meaning
+        (old annotations become origin 'manual' with no event type)."""
+        with self._lock:
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(annotations)").fetchall()}
+            for name, ddl in _ANNOTATION_EXTRA.items():
+                if name not in cols:
+                    self._db.execute(f"ALTER TABLE annotations ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -116,6 +135,10 @@ class Store:
                 "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, json.dumps(value)),
             )
+
+    def delete_setting(self, key: str) -> None:
+        with self.tx() as db:
+            db.execute("DELETE FROM settings WHERE key=?", (key,))
 
     # -- sessions ------------------------------------------------------------
     def create_session(
@@ -201,8 +224,19 @@ class Store:
     def add_annotation(self, sid: str, a: Annotation) -> None:
         with self.tx() as db:
             db.execute(
-                "INSERT INTO annotations(session_id,t_wall,t_mono,label,note) VALUES(?,?,?,?,?)",
-                (sid, a.t_wall, a.t_mono, a.label, a.note),
+                "INSERT INTO annotations(session_id,t_wall,t_mono,label,note,event_type,origin,confidence,evidence)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    sid,
+                    a.t_wall,
+                    a.t_mono,
+                    a.label,
+                    a.note,
+                    a.event_type,
+                    a.origin,
+                    a.confidence,
+                    json.dumps(a.evidence, sort_keys=True),
+                ),
             )
 
     # -- reads -----------------------------------------------------------------
@@ -222,6 +256,26 @@ class Store:
 
     def annotations(self, sid: str) -> list[Annotation]:
         rows = self._rows(
-            "SELECT t_wall,t_mono,label,note FROM annotations WHERE session_id=? ORDER BY t_wall", (sid,)
+            "SELECT t_wall,t_mono,label,note,event_type,origin,confidence,evidence FROM annotations "
+            "WHERE session_id=? ORDER BY t_wall, id",
+            (sid,),
         )
-        return [Annotation(**r) for r in rows]
+        out = []
+        for r in rows:
+            r["evidence"] = json.loads(r["evidence"] or "{}")
+            r["origin"] = r["origin"] or "manual"
+            out.append(Annotation(**r))
+        return out
+
+    def last_activity(self, sid: str) -> float | None:
+        """Wall time of the newest stored sample, exchange or event of a session."""
+        rows = self._rows(
+            "SELECT MAX(t) AS t FROM (SELECT MAX(t_wall) AS t FROM samples WHERE session_id=? "
+            "UNION ALL SELECT MAX(t_wall) FROM exchanges WHERE session_id=? "
+            "UNION ALL SELECT MAX(t_wall) FROM annotations WHERE session_id=?)",
+            (sid, sid, sid),
+        )
+        return rows[0]["t"] if rows else None
+
+    def open_sessions(self) -> list[dict[str, Any]]:
+        return [self._session(r) for r in self._rows("SELECT * FROM sessions WHERE ended_at IS NULL")]

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import LineChart from '../components/LineChart.vue'
-import { STALE_AFTER_MS, observedHz, useWorkbench } from '../stores/workbench'
+import EventMarkerBar from '../components/monitoring/EventMarkerBar.vue'
+import { observedHz, staleAfterMs, useWorkbench } from '../stores/workbench'
 import type { PidRef } from '../types'
 
 const wb = useWorkbench()
@@ -9,6 +10,8 @@ const profileId = ref('idle')
 const duration = ref(120)
 const label = ref('')
 const custom = ref('')
+const untilStop = ref(false)
+const maxDuration = ref<number | null>(null)
 const now = ref(Date.now())
 let timer: ReturnType<typeof setInterval> | undefined
 
@@ -19,21 +22,31 @@ onMounted(() => {
 onUnmounted(() => clearInterval(timer))
 watch([profileId, () => wb.connected, () => wb.activeProfileId], () => wb.connected && wb.loadPlan(profileId.value))
 
-const planned = computed<PidRef[]>(() => (wb.plan ? [...wb.plan.fast, ...wb.plan.slow] : []))
+const planned = computed<PidRef[]>(() => (wb.plan ? [...wb.plan.fast, ...(wb.plan.medium ?? []), ...wb.plan.slow] : []))
 const headline = computed(() => planned.value.find((p) => p.pid === 0x0c) ?? null)
 const others = computed(() => planned.value.filter((p) => p.pid !== 0x0c && p.pid !== 0x01))
 
 function tile(p: PidRef) {
   const sig = wb.live[p.pid]
   if (!sig) return { text: 'not measured', sub: wb.recording ? 'waiting for first sample' : 'no recording running', ok: false, stale: false, hz: 0 }
-  const stale = now.value - sig.at > STALE_AFTER_MS
+  const stale = now.value - sig.at > staleAfterMs(wb.monitor, p.pid)
   if (sig.value === null) return { text: 'not measured', sub: `last read failed (${sig.quality})`, ok: false, stale, hz: observedHz(sig) }
   return { text: String(Math.round(sig.value * 100) / 100), sub: `${sig.ok}/${sig.attempts} reads ok`, ok: true, stale, hz: observedHz(sig) }
 }
 const remaining = computed(() => {
   const r = wb.recording
-  return r ? Math.max(0, Math.round(r.started_at + r.duration_s - now.value / 1000)) : 0
+  return r && r.duration_s !== null ? Math.max(0, Math.round(r.started_at + r.duration_s - now.value / 1000)) : 0
 })
+const elapsed = computed(() => (wb.recording ? Math.max(0, Math.round(now.value / 1000 - wb.recording.started_at)) : 0))
+const stopText = computed(() => {
+  const r = wb.recording
+  if (!r) return ''
+  if (r.until_stop) return `Stop (running ${elapsed.value} s${r.duration_s !== null ? `, limit ${Math.round(r.duration_s)} s` : ''})`
+  return `Stop (${remaining.value} s left)`
+})
+function start() {
+  void wb.startRecording(duration.value, profileId.value, label.value, untilStop.value ? { untilStop: true, maxDurationS: maxDuration.value } : {})
+}
 function mark(text: string) {
   const sid = wb.recording?.session_id
   if (sid && text.trim()) void wb.annotate(sid, text.trim())
@@ -51,10 +64,14 @@ function mark(text: string) {
             <option v-for="p in wb.profile?.recording_profiles ?? []" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>
         </label>
-        <label class="text-sm"><span class="label block">Duration (s)</span><input v-model.number="duration" type="number" min="5" max="3600" class="field w-24" :disabled="!!wb.recording" /></label>
+        <label class="text-sm"><span class="label block">Duration (s)</span><input v-model.number="duration" type="number" min="5" max="3600" class="field w-24" :disabled="!!wb.recording || untilStop" /></label>
+        <label class="flex items-center gap-1 text-sm"><input v-model="untilStop" type="checkbox" data-test="until-stop" :disabled="!!wb.recording" /> Until I press Stop</label>
+        <label v-if="untilStop" class="text-sm"><span class="label block">Safety limit (s, optional)</span>
+          <input v-model.number="maxDuration" type="number" min="60" max="86400" class="field w-28" data-test="max-duration" :disabled="!!wb.recording" placeholder="none" />
+        </label>
         <label class="text-sm"><span class="label block">Label</span><input v-model="label" class="field w-48" placeholder="e.g. cold start" :disabled="!!wb.recording" /></label>
-        <button v-if="!wb.recording" class="btn-primary" data-test="start" :disabled="!!wb.busy || !planned.length" @click="wb.startRecording(duration, profileId, label)">Start recording</button>
-        <button v-else class="btn" data-test="stop" @click="wb.stopRecording()">Stop ({{ remaining }} s left)</button>
+        <button v-if="!wb.recording" class="btn-primary" data-test="start" :disabled="!!wb.busy || !planned.length" @click="start">Start recording</button>
+        <button v-else class="btn" data-test="stop" @click="wb.stopRecording()">{{ stopText }}</button>
       </div>
       <p v-if="wb.plan?.unsupported.length" class="mt-2 text-sm text-ink-2" data-test="plan-unsupported">
         Not supported by this ECU, so not recorded:
@@ -100,6 +117,11 @@ function mark(text: string) {
         <button v-for="l in wb.profile?.event_labels ?? []" :key="l" class="btn" @click="mark(l)">{{ l }}</button>
         <input v-model="custom" class="field" placeholder="custom marker" @keyup.enter="mark(custom); custom = ''" />
       </div>
+    </section>
+
+    <section v-if="wb.recording && wb.profile?.monitoring_events?.length" class="panel" data-test="monitoring-markers">
+      <h2 class="h2">MINI events</h2>
+      <EventMarkerBar :session-id="wb.recording.session_id" context="Fan / battery events can still be marked after the engine stops, as long as the recording runs." />
     </section>
 
     <section v-if="wb.plan" class="grid gap-3">

@@ -6,11 +6,14 @@ annotate, replay. There is no pass-through for arbitrary adapter commands.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any
 
 from app.acquisition.hub import LiveHub
+from app.acquisition.monitor import MonitoringRecorder
 from app.acquisition.recorder import Recorder, compute_metrics
 from app.adapters.base import Transport
 from app.adapters.simulator import SCENARIOS, FakeElmServer
@@ -19,7 +22,22 @@ from app.manufacturer.extension import ExtensionRegistry, default_registry
 from app.models.domain import Annotation, Exchange, Reading
 from app.obd.client import ObdClient
 from app.storage.db import Store
-from app.vehicles.profiles import DEFAULT_PROFILE_ID, PROFILES, VehicleProfile, get_profile, resolve_schedule
+from app.vehicles.profiles import (
+    DEFAULT_PROFILE_ID,
+    PROFILES,
+    RecordingProfile,
+    VehicleProfile,
+    get_profile,
+    resolve_schedule,
+    resolve_tiers,
+)
+
+#: a session whose owner has not refreshed its lease for this long is treated as interrupted
+LEASE_STALE_S = 120.0
+LEASE_REFRESH_S = 10.0
+DRIVE_TYPES = ("city", "highway", "mixed", "other")
+#: latest measurements attached (as context, with their age) to manual events during a live recording
+EVENT_CONTEXT_SIGNALS = {"0C": "rpm", "05": "coolant_c", "0D": "speed_kmh", "42": "ecu_voltage_v"}
 
 
 class BusyError(Exception):
@@ -59,6 +77,7 @@ class Workbench:
         self._sid: str | None = None
         self._phase = "init"
         self._stop = threading.Event()
+        self._resume = threading.Event()  # "resume ECU polling" for a monitoring recording
         self._last_status: dict[str, Any] = {}
 
     # -- vehicle profile -------------------------------------------------------
@@ -286,9 +305,14 @@ class Workbench:
         self.store.add_exchanges(sid, list(self._connect_log))
         self._sid = sid
         meta: dict[str, Any] = {}
+        beat_stop = threading.Event()
+        self._lease(sid)
+        beat = threading.Thread(target=self._heartbeat, args=(sid, beat_stop), daemon=True, name="lease")
+        beat.start()
         try:
             yield sid, client, meta
         finally:
+            beat_stop.set()
             self._flush()
             self._sid = None
             self._phase = "idle"
@@ -298,6 +322,53 @@ class Workbench:
             meta["transport"] = client.transport.describe()
             meta["metrics"] = [m.model_dump() for m in compute_metrics(self.store.samples(sid))]
             self.store.update_session(sid, ended_at=clock.wall(), meta=meta)
+            self.store.delete_setting(f"lease:{sid}")
+
+    # -- interrupted sessions -------------------------------------------------------
+    def _lease(self, sid: str) -> None:
+        self.store.set_setting(f"lease:{sid}", {"pid": os.getpid(), "t": time.time()})
+
+    def _heartbeat(self, sid: str, stop: threading.Event) -> None:
+        """Mark the session as owned by a live process (lets another process tell a running
+        recording from one whose process died)."""
+        while not stop.wait(LEASE_REFRESH_S):
+            try:
+                self._lease(sid)
+            except Exception:  # never let bookkeeping break a recording
+                pass
+
+    def recover_interrupted(self, stale_after_s: float = LEASE_STALE_S) -> list[str]:
+        """Close sessions left open by a process that died (crash, kill, power loss).
+
+        Everything that was written stays; the session gets an end time (its newest stored
+        record), an ``aborted`` reason and sampling metrics. A session whose lease is still
+        being refreshed (a recording in another process) is left alone.
+        """
+        recovered: list[str] = []
+        for s in self.store.open_sessions():
+            sid = s["id"]
+            if sid == self._sid:
+                continue
+            lease = self.store.get_setting(f"lease:{sid}")
+            if lease and time.time() - float(lease.get("t", 0)) < stale_after_s:
+                continue
+            last = self.store.last_activity(sid)
+            if not lease and last is not None and time.time() - last < stale_after_s:
+                continue  # no lease (older version / other tool) but still being written
+            ended = last if last is not None else s["started_at"]
+            self.store.update_session(
+                sid,
+                ended_at=ended,
+                meta={
+                    "aborted": "interrupted: the application stopped before the session was closed; "
+                    "data up to the last stored record is kept",
+                    "recovered": {"at": time.time(), "last_record_wall": last, "lease": lease},
+                    "metrics": [m.model_dump() for m in compute_metrics(self.store.samples(sid))],
+                },
+            )
+            self.store.delete_setting(f"lease:{sid}")
+            recovered.append(sid)
+        return recovered
 
     def _flush(self, readings: list[Reading] | None = None) -> None:
         with self._buf_lock:
@@ -324,6 +395,9 @@ class Workbench:
             meta["monitors"] = client.monitors()
         return sid
 
+    def recording_profile(self, profile_id: str) -> RecordingProfile:
+        return self.profile.recording_profile(profile_id)
+
     def plan_recording(self, profile_id: str = "idle", pids: list[int] | None = None) -> dict[str, list[int]]:
         supported = self._need_client()._caps().supported_mode01()
         if pids:
@@ -332,12 +406,19 @@ class Workbench:
                 "slow": [],
                 "unsupported": [p for p in pids if p not in supported],
             }
-        fast, slow, missing = resolve_schedule(self.profile.recording_profile(profile_id), supported)
+        rp = self.profile.recording_profile(profile_id)
+        if rp.tiers is not None:
+            return resolve_tiers(rp, supported)
+        fast, slow, missing = resolve_schedule(rp, supported)
         return {"fast": fast, "slow": slow, "unsupported": missing}
+
+    def adapter_voltage_available(self) -> bool:
+        """ATRV answered during adapter initialisation (clones may not implement it)."""
+        return bool(self.client and self.client.adapter.voltage)
 
     def record(
         self,
-        duration_s: float,
+        duration_s: float | None,
         profile_id: str = "idle",
         pids: list[int] | None = None,
         label: str = "",
@@ -345,15 +426,59 @@ class Workbench:
         post_scan: bool = True,
         freeze_frame: bool = False,
         started: threading.Event | None = None,
+        *,
+        until_stop: bool = False,
+        max_duration_s: float | None = None,
+        drive_type: str | None = None,
+        resume_probe_s: float | None = None,
     ) -> str:
+        """Record until ``duration_s`` elapsed or, with ``until_stop``, until stop_recording()
+        (``max_duration_s`` is then an optional safety limit). Samples are written to SQLite
+        about once a second; nothing is held for the whole drive."""
+        if until_stop:
+            limit = max_duration_s
+        elif duration_s is None:
+            raise ValueError("a duration is required unless the recording runs until stopped")
+        else:
+            limit = duration_s
+        if limit is not None and limit <= 0:
+            raise ValueError("duration must be positive")
+        if drive_type is not None and drive_type not in DRIVE_TYPES:
+            raise ValueError(f"drive type must be one of {', '.join(DRIVE_TYPES)}")
         plan = self.plan_recording(profile_id, pids)
+        rp = None if pids else self.profile.recording_profile(profile_id)
+        tiered = rp is not None and rp.tiers is not None
         with self._session("record", label) as (sid, client, meta):
             self._stop = threading.Event()  # only once we own the operation lock
+            self._resume = threading.Event()
             clock = client.transport.clock
+            use_atrv = bool(tiered and rp and rp.adapter_voltage and client.adapter.voltage)
             meta.update(
-                selected=plan, recording_profile=None if pids else profile_id, requested_duration_s=duration_s
+                selected=plan,
+                recording_profile=None if pids else profile_id,
+                requested_duration_s=None if until_stop else duration_s,
+                until_stop=until_stop,
+                max_duration_s=max_duration_s if until_stop else None,
             )
-            self.active = {"session_id": sid, "started_at": clock.wall(), "duration_s": duration_s, **plan}
+            if drive_type:
+                meta["user_labels"] = {"drive_type": drive_type}
+            if tiered and rp is not None:
+                meta["sampling_plan"] = {
+                    "tiers": rp.tiers.as_dict() if rp.tiers else None,
+                    "adapter_voltage": "polled"
+                    if use_atrv
+                    else ("adapter did not answer ATRV" if rp.adapter_voltage else "not requested"),
+                }
+            self.active = {
+                "session_id": sid,
+                "started_at": clock.wall(),
+                "duration_s": limit,
+                "until_stop": until_stop,
+                "profile": profile_id if not pids else None,
+                "monitoring": bool(tiered and rp and rp.monitoring),
+                **plan,
+            }
+            self.hub.latest.clear()  # never show/attach values from an earlier recording
             self.hub.publish({"type": "recording", "state": "started", **self.active})
             if started:
                 started.set()
@@ -370,21 +495,67 @@ class Workbench:
                     pending.clear()
                     last_flush = clock.monotonic()
 
+            def on_event(a: Annotation) -> None:
+                self.store.add_annotation(sid, a)
+                self.hub.publish({"type": "annotation", "session_id": sid, "annotation": a.model_dump()})
+
+            def on_state(snap: dict[str, Any]) -> None:
+                if self.active and self.active.get("session_id") == sid:
+                    self.active["monitor"] = snap
+                self.hub.publish({"type": "monitor", "session_id": sid, "monitor": snap})
+
+            monitor: MonitoringRecorder | None = None
             try:
                 if pre_scan:
                     self._phase = "scan:pre"
                     self.store.add_scan(sid, client.scan_dtcs("pre", freeze_frame))
                 self._phase = "record"
-                Recorder(client, plan["fast"], plan["slow"], duration_s, on_readings, self._stop).run()
+                if tiered and rp is not None and rp.tiers is not None:
+                    monitor = MonitoringRecorder(
+                        client,
+                        plan,
+                        rp.tiers,
+                        use_atrv,
+                        limit,
+                        on_readings,
+                        on_event,
+                        self._stop,
+                        self._resume,
+                        on_state,
+                        resume_probe_s=resume_probe_s,
+                        primary_ecu=client.capabilities.primary_ecu if client.capabilities else None,
+                    )
+                    monitor.run()
+                else:
+                    Recorder(
+                        client,
+                        plan["fast"],
+                        plan["slow"],
+                        float("inf") if limit is None else limit,
+                        on_readings,
+                        self._stop,
+                    ).run()
                 self._flush(list(pending))
                 pending.clear()
                 if post_scan:
-                    self._phase = "scan:post"
-                    self.store.add_scan(sid, client.scan_dtcs("post", freeze_frame))
-            except Exception as exc:  # keep what was captured; record why it ended
+                    if monitor is not None and monitor.state != "running":
+                        # never send a scan to an ECU that stopped answering (it may be asleep)
+                        meta["post_scan_skipped"] = (
+                            f"recording ended with the link in state '{monitor.state}'; no request is sent "
+                            "to an unresponsive ECU"
+                        )
+                    else:
+                        self._phase = "scan:post"
+                        self.store.add_scan(sid, client.scan_dtcs("post", freeze_frame))
+            except BaseException as exc:  # keep what was captured; record why it ended
                 meta["aborted"] = f"{type(exc).__name__}: {exc}"
                 self._flush(list(pending))
+                pending.clear()
+                if not isinstance(exc, Exception):
+                    raise  # KeyboardInterrupt / SystemExit: the session is still closed below
             finally:
+                if monitor is not None:
+                    meta["monitoring"] = monitor.summary()
                 self.active = None
                 self.hub.publish({"type": "recording", "state": "stopped", "session_id": sid})
         return sid
@@ -392,18 +563,86 @@ class Workbench:
     def stop_recording(self) -> None:
         self._stop.set()
 
-    def annotate(self, sid: str, label: str, note: str = "") -> Annotation:
-        if self.store.get_session(sid) is None:
+    def resume_ecu_polling(self) -> dict[str, Any]:
+        """Ask a running monitoring recording to send ONE vehicle request to check whether the
+        ECU answers again (after ecu_communication_lost). Does not touch the operation lock."""
+        act = self.active
+        if not act or not act.get("monitoring"):
+            raise NotConnectedError("no monitoring recording is running")
+        state = (act.get("monitor") or {}).get("state")
+        if state != "ecu_unresponsive":
+            return {"requested": False, "state": state, "detail": "vehicle polling is not paused"}
+        self._resume.set()
+        return {"requested": True, "state": state}
+
+    def set_drive_type(self, sid: str, drive_type: str | None) -> dict[str, Any]:
+        """User label city / highway / mixed / other (or None to clear). Stored in session meta."""
+        s = self.store.get_session(sid)
+        if s is None:
             raise KeyError(f"no session {sid}")
+        if drive_type is not None and drive_type not in DRIVE_TYPES:
+            raise ValueError(f"drive type must be one of {', '.join(DRIVE_TYPES)}")
+        labels = dict(s["meta"].get("user_labels") or {})
+        labels["drive_type"] = drive_type
+        self.store.update_session(sid, meta={"user_labels": labels})
+        return labels
+
+    def _event_context(self) -> dict[str, Any]:
+        """Latest measured values (with their age) at the moment a manual event is marked."""
+        out: dict[str, Any] = {}
+        now = time.time()
+        for key, r in list(self.hub.latest.items()):
+            pid, _, ecu = key.partition(":")
+            mode = r.get("mode", 1)
+            name = "adapter_voltage_v" if mode == 0 else EVENT_CONTEXT_SIGNALS.get(f"{int(pid):02X}")
+            if not name or r.get("value") is None or r.get("quality") != "ok":
+                continue
+            primary = (
+                self.client.capabilities.primary_ecu if self.client and self.client.capabilities else None
+            )
+            if mode == 1 and ecu not in ("None", primary or ecu):
+                continue
+            out[name] = {"value": r["value"], "age_s": round(now - r["t_wall"], 1)}
+        act = self.active or {}
+        mon = act.get("monitor") or {}
+        if mon:
+            out["link_state"] = mon.get("state")
+            out["engine"] = mon.get("engine")
+        return out
+
+    def annotate(
+        self, sid: str, label: str = "", note: str = "", event_type: str | None = None
+    ) -> Annotation:
+        """Manual marker (free text) or predefined event (``event_type``). Works during a recording,
+        after the engine stopped and after the recording ended (wall-clock time then)."""
+        session = self.store.get_session(sid)
+        if session is None:
+            raise KeyError(f"no session {sid}")
+        evidence: dict[str, Any] = {}
+        if event_type is not None:
+            prof = get_profile(session["vehicle_profile"])
+            labels = {i: lbl for i, lbl, _ in prof.monitoring_events}
+            if event_type not in labels:
+                raise ValueError(
+                    f"unknown event type {event_type!r} for {prof.id}; known: {', '.join(labels) or 'none'}"
+                )
+            label = label or event_type
+        if not label:
+            raise ValueError("a marker needs a label or an event type")
         live = self.active and self.active["session_id"] == sid and self.client
         clock = self.client.transport.clock if live else None  # type: ignore[union-attr]
-        import time
-
+        if live and event_type is not None:
+            ctx = self._event_context()
+            if ctx:
+                evidence["context_at_mark"] = ctx
         a = Annotation(
             t_wall=clock.wall() if clock else time.time(),
             t_mono=clock.monotonic() if clock else None,
             label=label,
             note=note,
+            event_type=event_type,
+            origin="manual",
+            evidence=evidence,
         )
         self.store.add_annotation(sid, a)
         self.hub.publish({"type": "annotation", "session_id": sid, "annotation": a.model_dump()})

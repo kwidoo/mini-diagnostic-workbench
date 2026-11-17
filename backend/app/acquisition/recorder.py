@@ -15,7 +15,7 @@ from typing import Any
 from app.adapters.base import TransportClosedError, TransportError
 from app.models.domain import PidMetrics, Reading
 from app.obd.client import ObdClient, ObdError
-from app.parameters.standard_pids import pid_name
+from app.parameters.standard_pids import pid_name, signal_name
 
 GOOD = ("ok", "raw_only")
 
@@ -73,20 +73,21 @@ class Recorder:
 
 
 def compute_metrics(samples: list[dict[str, Any]]) -> list[PidMetrics]:
-    """Per-PID sampling quality from stored samples (mode 01 only).
+    """Per-signal sampling quality from stored samples (service 01, plus adapter-measured mode 0).
 
     One *attempt* = one request (several ECUs answering the same request share
     its timestamp). actual_hz = successful requests / session span.
     """
-    rows = [s for s in samples if s["mode"] == 1]
+    rows = [s for s in samples if s["mode"] in (0, 1)]
     if not rows:
         return []
     span = max(s["t_mono"] for s in rows) - min(s["t_mono"] for s in rows)
-    by_pid: dict[int, dict[float, list[dict[str, Any]]]] = {}
+    by_pid: dict[tuple[int, int], dict[float, list[dict[str, Any]]]] = {}
     for s in rows:
-        by_pid.setdefault(s["pid"], {}).setdefault(s["t_mono"], []).append(s)
+        by_pid.setdefault((s["mode"], s["pid"]), {}).setdefault(s["t_mono"], []).append(s)
     out: list[PidMetrics] = []
-    for pid, attempts in sorted(by_pid.items()):
+    # service 01 first (sorted by PID), adapter signals last: keeps the established order
+    for (mode, pid), attempts in sorted(by_pid.items(), key=lambda kv: (kv[0][0] != 1, kv[0][1])):
         ok_times = sorted(t for t, rs in attempts.items() if any(r["quality"] in GOOD for r in rs))
         lat = sorted(
             rs[0]["latency_ms"] for t, rs in attempts.items() if any(r["quality"] in GOOD for r in rs)
@@ -97,7 +98,8 @@ def compute_metrics(samples: list[dict[str, Any]]) -> list[PidMetrics]:
         out.append(
             PidMetrics(
                 pid=pid,
-                name=pid_name(pid),
+                mode=mode,
+                name=signal_name(mode, pid),
                 attempts=n,
                 ok=ok,
                 dropped=n - ok,

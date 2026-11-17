@@ -10,10 +10,14 @@ const props = withDefaults(
     unit?: string | null
     series: ChartSeries[]
     failed?: [number, string][]
-    markers?: { t: number | null; label: string }[]
+    markers?: { t: number | null; label: string; origin?: string }[]
+    /** shaded time ranges, e.g. an inferred 'possible regeneration' (drawn hatched, never as a value) */
+    bands?: { from: number; to: number; label: string }[]
+    /** shared x range (seconds) so stacked charts line up */
+    domain?: [number, number] | null
     height?: number
   }>(),
-  { unit: '', failed: () => [], markers: () => [], height: 150 },
+  { unit: '', failed: () => [], markers: () => [], bands: () => [], domain: null, height: 150 },
 )
 
 const W = 720
@@ -23,6 +27,7 @@ const hoverT = ref<number | null>(null)
 const all = computed(() => props.series.flatMap((s) => s.points))
 const empty = computed(() => all.value.length === 0)
 const xDomain = computed<[number, number]>(() => {
+  if (props.domain) return props.domain
   const ts = [...all.value.map((p) => p[0]), ...props.failed.map((f) => f[0])]
   return ts.length ? [Math.min(...ts), Math.max(...ts, Math.min(...ts) + 1)] : [0, 1]
 })
@@ -77,8 +82,15 @@ const fmt = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 
         <text :x="M.l - 6" :y="y(t) + 3" text-anchor="end" font-size="10" fill="#52514e">{{ fmt(t) }}</text>
       </g>
       <text v-for="t in xTicks" :key="`x${t}`" :x="x(t)" :y="height - 6" text-anchor="middle" font-size="10" fill="#52514e">{{ t }} s</text>
-      <g v-for="(m, i) in markers.filter((mk) => mk.t !== null)" :key="`m${i}`" data-test="marker">
-        <line :x1="x(m.t as number)" :x2="x(m.t as number)" :y1="M.t" :y2="height - M.b" stroke="#52514e" stroke-width="1" stroke-dasharray="3 3" />
+      <g v-for="(b, i) in bands" :key="`b${i}`" data-test="band">
+        <rect :x="x(b.from)" :y="M.t" :width="Math.max(1, x(b.to) - x(b.from))" :height="height - M.t - M.b" fill="#b97700" opacity="0.12" />
+        <text :x="x(b.from) + 3" :y="height - M.b - 4" font-size="9" fill="#b97700">{{ b.label }}</text>
+      </g>
+      <g v-for="(m, i) in markers.filter((mk) => mk.t !== null)" :key="`m${i}`" data-test="marker" :data-origin="m.origin ?? 'manual'">
+        <line
+          :x1="x(m.t as number)" :x2="x(m.t as number)" :y1="M.t" :y2="height - M.b" stroke-width="1"
+          :stroke="m.origin === 'observed' ? '#2a78d6' : '#52514e'" :stroke-dasharray="m.origin === 'observed' ? '' : '3 3'"
+        />
         <text
           :x="x(m.t as number) + (x(m.t as number) > W * 0.75 ? -3 : 3)" :y="M.t + 9" font-size="9" fill="#52514e"
           :text-anchor="x(m.t as number) > W * 0.75 ? 'end' : 'start'"

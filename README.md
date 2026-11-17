@@ -27,17 +27,21 @@ diagnostics are not implemented, and no profile is hardware-validated yet. Follo
 checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
 real session.
 
-### Last verified test run (2026-11-17, Linux VM, Python 3.15, Node 22)
+### Last verified test run (2026-11-17, Linux VM, Python 3.12+, Node 22)
 
 ```
 $ cd backend && uv run ruff check app tests && uv run pytest
 All checks passed!
-242 passed in 58.34s
+301 passed in 153.13s
 $ cd frontend && npm run typecheck && npm test
 > vue-tsc --noEmit
- Test Files  4 passed (4)
-      Tests  22 passed (22)
+ Test Files  6 passed (6)
+      Tests  35 passed (35)
 ```
+
+Continuous monitoring (docs/MONITORING.md) is covered by `tests/test_monitoring.py`,
+`tests/test_monitoring_api.py` and `src/__tests__/monitoring.spec.ts`, against synthetic
+drive cycles only.
 
 Covered since the review follow-up: late/partial/trailing replies and cancel/timeout/
 connection loss on real sockets (`tests/test_resync.py`), concurrent lifecycle
@@ -74,6 +78,10 @@ mini-obd scan                                   # stored / pending / permanent D
 mini-obd scan --read-vin                        # also read the VIN (kept local)
 mini-obd inventory                              # which PIDs the ECU supports, each read once
 mini-obd record --duration 120 --profile idle   # timed recording with pre/post fault scans
+mini-obd record --profile mini_extended_monitoring --until-stop   # continuous; Ctrl-C stops and saves
+mini-obd annotate --event fan_running           # predefined event (also while another process records)
+mini-obd monitoring                             # shutdowns, fan runs, voltage, DPF availability
+mini-obd drive-type city                        # label the latest session
 mini-obd replay ../fixtures/rough-idle.jsonl    # import a transcript as a session
 mini-obd sessions
 mini-obd analyze --session <session-id>         # or omit for the latest
@@ -83,7 +91,10 @@ mini-obd serve                                  # API + dashboard
 
 Add `--simulator <scenario>` to `probe`, `scan`, `inventory` or `record` to use the fake
 adapter (`healthy_idle`, `rough_idle`, `egr_mismatch`, `dpf_history`, `wifi_drop`,
-`unsupported_pids`, `slow_adapter`, `porsche_healthy_idle`, `porsche_bank_imbalance`).
+`unsupported_pids`, `slow_adapter`, `porsche_healthy_idle`, `porsche_bank_imbalance`, and the
+synthetic drive cycles `mini_city_drive`, `mini_highway_drive`, `mini_warmup`,
+`mini_dpf_regen_possible`, `mini_shutdown_during_regen`, `mini_voltage_drop`,
+`mini_ignition_off`, `mini_ecu_silent_running`). Continuous monitoring: docs/MONITORING.md.
 Add `--vehicle porsche-boxster-986-mk2` before the command for the other profile.
 
 ## First run on the actual MINI

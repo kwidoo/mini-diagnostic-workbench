@@ -24,9 +24,10 @@ from app.acquisition.recorder import GOOD
 from app.adapters.base import TransportError
 from app.adapters.simulator import SCENARIOS
 from app.adapters.tcp import DEFAULT_HOST, DEFAULT_PORT
-from app.diagnostics.engine import analyze_session
+from app.diagnostics.engine import analyze_session, load_session
+from app.diagnostics.monitoring import history_row, is_monitoring_session, references, summary_for
 from app.obd.client import ObdError
-from app.parameters.standard_pids import PIDS, RAW_ONLY_PIDS, pid_name
+from app.parameters.standard_pids import ADAPTER_MODE, ADAPTER_VOLTAGE_NAME, PIDS, RAW_ONLY_PIDS, pid_name
 from app.service import BusyError, NotConnectedError, Workbench
 from app.storage.db import Store
 from app.storage.export import build_zip
@@ -49,15 +50,24 @@ class ScanBody(BaseModel):
 
 
 class RecordBody(BaseModel):
-    duration_s: float = Field(120, gt=0, le=3600)
+    duration_s: float = Field(120, gt=0, le=3600)  # ignored when until_stop is set
     profile: str = "idle"
     pids: list[int] | None = None
     label: str = ""
+    until_stop: bool = False  # run until POST /api/recording/stop
+    max_duration_s: float | None = Field(None, gt=0, le=86400)  # optional safety limit for until_stop
+    drive_type: str | None = None  # user label: city | highway | mixed | other
+    resume_probe_s: float | None = Field(None, ge=30, le=3600)  # opt-in: probe a silent ECU this often
 
 
 class AnnotationBody(BaseModel):
-    label: str = Field(min_length=1, max_length=120)
+    label: str = Field("", max_length=120)
     note: str = Field("", max_length=1000)
+    event_type: str | None = Field(None, max_length=60)  # predefined event (see profile monitoring_events)
+
+
+class DriveTypeBody(BaseModel):
+    drive_type: str | None = None
 
 
 class ProfileBody(BaseModel):
@@ -74,20 +84,27 @@ def _series(store: Store, sid: str) -> dict[str, Any]:
     if session is None:
         raise KeyError(sid)
     primary = (session["meta"].get("capabilities") or {}).get("primary_ecu")
-    rows = [s for s in store.samples(sid) if s["mode"] == 1]
-    t0 = min((s["t_mono"] for s in rows), default=0.0)
+    all_rows = store.samples(sid)
+    rows = [s for s in all_rows if s["mode"] == 1]
+    first = min(rows, key=lambda s: s["t_mono"]) if rows else None
+    t0 = first["t_mono"] if first else 0.0
+    wall0 = first["t_wall"] if first else None
     signals: dict[int, dict[str, Any]] = {}
-    for s in rows:
-        if s["ecu"] not in (None, primary) and primary is not None:
+    # adapter-measured supply voltage (ATRV) is its own signal: pid -1, provenance "adapter"
+    for s in rows + [r for r in all_rows if r["mode"] == ADAPTER_MODE]:
+        if s["mode"] == 1 and s["ecu"] not in (None, primary) and primary is not None:
             continue
+        adapter = s["mode"] == ADAPTER_MODE
+        key = -1 if adapter else s["pid"]
         sig = signals.setdefault(
-            s["pid"],
+            key,
             {
-                "pid": s["pid"],
-                "hex": f"{s['pid']:02X}",
-                "name": s["name"],
+                "pid": key,
+                "hex": "ATRV" if adapter else f"{s['pid']:02X}",
+                "name": ADAPTER_VOLTAGE_NAME if adapter else s["name"],
                 "unit": s["unit"],
-                "decoded": s["pid"] in PIDS,
+                "decoded": adapter or s["pid"] in PIDS,
+                "provenance": "adapter" if adapter else "ecu",
                 "points": [],
                 "failed": [],
             },
@@ -97,10 +114,15 @@ def _series(store: Store, sid: str) -> dict[str, Any]:
             sig["points"].append([t, s["value"]])
         elif s["quality"] not in GOOD:
             sig["failed"].append([t, s["quality"]])
-    ann = [
-        {"t": round(a.t_mono - t0, 3) if a.t_mono is not None and rows else None, **a.model_dump()}
-        for a in store.annotations(sid)
-    ]
+
+    def rel(a) -> float | None:
+        if not rows:
+            return None
+        if a.t_mono is not None:
+            return round(a.t_mono - t0, 3)
+        return round(a.t_wall - wall0, 3) if wall0 is not None else None  # marked after the recording
+
+    ann = [{"t": rel(a), **a.model_dump()} for a in store.annotations(sid)]
     return {
         "session_id": sid,
         "signals": sorted(signals.values(), key=lambda x: x["pid"]),
@@ -122,6 +144,7 @@ def _session_detail(store: Store, sid: str) -> dict[str, Any]:
 def create_app(db_path: str | None = None) -> FastAPI:
     store = Store(db_path or config.db_path())
     wb = Workbench(store)
+    wb.recover_interrupted()  # close sessions a crashed/killed process left open (data is kept)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -225,7 +248,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/recording/plan")
     def plan(profile: str = "idle") -> dict[str, Any]:
         p = wb.plan_recording(profile)
-        return {
+        rp = wb.recording_profile(profile)
+        out = {
             k: [
                 {
                     "pid": x,
@@ -237,6 +261,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ]
             for k, v in p.items()
         }
+        out["tiers"] = rp.tiers.as_dict() if rp.tiers else None
+        out["monitoring"] = rp.monitoring
+        out["description"] = rp.description
+        out["adapter_voltage"] = (
+            ("polled" if wb.adapter_voltage_available() else "adapter did not answer ATRV")
+            if rp.adapter_voltage
+            else "not requested"
+        )
+        return out
 
     @app.post("/api/recording/start")
     def start(body: RecordBody) -> dict[str, Any]:
@@ -248,7 +281,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         def run() -> None:
             try:
-                wb.record(body.duration_s, body.profile, body.pids, body.label, started=started)
+                wb.record(
+                    body.duration_s,
+                    body.profile,
+                    body.pids,
+                    body.label,
+                    started=started,
+                    until_stop=body.until_stop,
+                    max_duration_s=body.max_duration_s,
+                    drive_type=body.drive_type,
+                    resume_probe_s=body.resume_probe_s,
+                )
             except Exception as exc:  # surfaced through /api/status polling and the session meta
                 err.append(exc)
                 started.set()
@@ -264,6 +307,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
         wb.stop_recording()
         return {"stopping": True}
 
+    @app.post("/api/recording/resume-ecu")
+    def resume_ecu() -> dict[str, Any]:
+        # one vehicle request to see whether a silent ECU answers again (user decision)
+        return wb.resume_ecu_polling()
+
     # -- sessions ----------------------------------------------------------------
     @app.get("/api/sessions")
     def sessions(vehicle: str | None = None) -> list[dict[str, Any]]:
@@ -272,6 +320,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             meta = s.pop("meta")
             s["aborted"] = meta.get("aborted")
             s["scenario"] = meta.get("scenario")
+            s["recording_profile"] = meta.get("recording_profile")
+            s["monitoring"] = bool(meta.get("sampling_plan") or meta.get("monitoring"))
+            s["drive_type"] = (meta.get("user_labels") or {}).get("drive_type")
             out.append(s)
         return out[::-1]
 
@@ -289,7 +340,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{sid}/annotations")
     def annotate(sid: str, body: AnnotationBody) -> dict[str, Any]:
-        return wb.annotate(sid, body.label, body.note).model_dump()
+        # always origin "manual": a person cannot post an observed/inferred event
+        return wb.annotate(sid, body.label, body.note, body.event_type).model_dump()
+
+    @app.get("/api/sessions/{sid}/monitoring")
+    def monitoring(sid: str) -> dict[str, Any]:
+        if store.get_session(sid) is None:
+            raise KeyError(f"no session {sid}")
+        return summary_for(store, sid)
+
+    @app.put("/api/sessions/{sid}/drive-type")
+    def drive_type(sid: str, body: DriveTypeBody) -> dict[str, Any]:
+        return wb.set_drive_type(sid, body.drive_type)
+
+    @app.get("/api/monitoring/history")
+    def monitoring_history(vehicle: str | None = None) -> dict[str, Any]:
+        prof = vehicle or wb.profile.id
+        sessions = [
+            load_session(store, s["id"]) for s in store.list_sessions(prof) if is_monitoring_session(s)
+        ]
+        refs = references(sessions)
+        return {
+            "vehicle_profile": prof,
+            "references": {"usual_warm_coolant": refs["plateau"], "warm_idle_baseline": refs["baseline"]},
+            "sessions": [history_row(sd, refs) for sd in reversed(sessions)],
+        }
 
     @app.get("/api/sessions/{sid}/export")
     def export(sid: str, include_vin: bool = False) -> Response:
