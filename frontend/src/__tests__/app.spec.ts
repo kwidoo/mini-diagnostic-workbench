@@ -100,7 +100,7 @@ describe('no control surface', () => {
     vi.unstubAllGlobals()
     mockFetch({ ...baseRoutes(connected), 'GET /api/recording/plan': { fast: [], slow: [], unsupported: [] } })
     const w = await mountApp()
-    for (const tab of ['connection', 'vehicle', 'faults', 'live', 'sessions', 'findings']) {
+    for (const tab of ['connection', 'vehicle', 'faults', 'live', 'monitoring', 'sessions', 'findings']) {
       await w.get(`[data-test=tab-${tab}]`).trigger('click')
       await flushPromises()
       const controls = w.findAll('button, a, input, select').map((b) => `${b.text()} ${b.attributes('placeholder') ?? ''}`.toLowerCase())

@@ -102,3 +102,34 @@ def test_errors(run):
     assert run("replay", "/nonexistent.jsonl")[0] == 2
     with pytest.raises(SystemExit):
         main(["raw", "04"])  # there is no raw command
+
+
+def test_record_until_stop_with_monitoring_profile_and_events(run):
+    code, out, err = run(
+        "record", "--simulator", "mini_city_drive", "--profile", "mini_extended_monitoring",
+        "--until-stop", "--max-duration", "4", "--drive-type", "city", "--no-post-scan",
+    )  # fmt: skip
+    assert code == 0, err
+    assert "recording until stopped (safety limit 4 s)" in err and "recording (medium):" in err
+    assert "not supported, skipped:" in err and "7A" in err  # DPF PIDs this ECU does not offer
+    assert "ATRV" in out and "session " in out
+    code, out, err = run("annotate", "--event", "fan_running", "--note", "after stop")
+    assert code == 0 and "fan_running" in out
+    code, out, _ = run("annotate", "--event", "fan_stopped")
+    assert code == 0
+    code, out, _ = run("monitoring")
+    assert code == 0 and "fan runs (manual markers):" in out and "voltage adapter:" in out
+    assert "Calculated soot mass: not_available" in out
+    code, out, _ = run("drive-type", "highway")
+    assert code == 0 and "highway" in out
+    code, out, _ = run("sessions")
+    assert "(highway)" in out
+    code, out, _ = run("--json", "monitoring")
+    m = json.loads(out)
+    assert m["fan"]["runs"][0]["complete"] is True and m["is_monitoring_session"] is True
+
+
+def test_annotate_rejects_unknown_event(run):
+    run("record", "--simulator", "healthy_idle", "--duration", "1", "--no-pre-scan", "--no-post-scan")
+    with pytest.raises(SystemExit):
+        run("annotate", "--event", "warp_drive")

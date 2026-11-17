@@ -5,6 +5,7 @@ import ConnectionView from './views/ConnectionView.vue'
 import FaultsView from './views/FaultsView.vue'
 import FindingsView from './views/FindingsView.vue'
 import LiveView from './views/LiveView.vue'
+import MonitoringView from './views/MonitoringView.vue'
 import SessionsView from './views/SessionsView.vue'
 import VehicleView from './views/VehicleView.vue'
 
@@ -14,6 +15,7 @@ const tabs = [
   { id: 'vehicle', name: 'Vehicle', view: VehicleView },
   { id: 'faults', name: 'Faults', view: FaultsView },
   { id: 'live', name: 'Live', view: LiveView },
+  { id: 'monitoring', name: 'MINI monitoring', view: MonitoringView },
   { id: 'sessions', name: 'Sessions & compare', view: SessionsView },
   { id: 'findings', name: 'Findings', view: FindingsView },
 ]

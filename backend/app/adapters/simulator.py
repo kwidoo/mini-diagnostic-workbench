@@ -79,6 +79,10 @@ class Scenario:
     mil: bool = False
     second_ecu: bool = True
     synthetic: bool = True
+    # t -> does the engine ECU answer OBD requests? (None: always). Models ignition off / sleeping ECU.
+    ecu_online: Callable[[float], bool] | None = None
+    # t -> adapter supply voltage for ATRV (None: constant 14.1 V). Adapter-local, works with the ECU asleep.
+    adapter_voltage: Callable[[float], float] | None = None
 
 
 # -- synthetic signal generators ------------------------------------------------
@@ -130,6 +134,149 @@ def _minimal(t: float, rng: random.Random) -> dict[int, float]:
     return {0x04: 22, 0x05: 80, 0x0C: 800 + rng.gauss(0, 4), 0x0D: 0, 0x0F: 27}
 
 
+# -- synthetic drive cycles for the monitoring recorder ---------------------------------------
+# A drive is a list of (phase, duration_s). Phases:
+#   "ign"    ignition on, engine off (ECU answers, RPM 0)
+#   "idle"   engine idling, stationary
+#   "city"   stop-and-go up to ~50 km/h
+#   "road"   steady ~110 km/h
+#   "regen"  stationary idle with the indirect regeneration pattern (EGR closed, RPM/MAF raised)
+#   "off"    ignition off: the ECU stops answering; only the adapter voltage remains
+# Everything is invented to exercise the software, not modelled on a real MINI.
+
+
+@dataclass(frozen=True)
+class DriveCycle:
+    phases: tuple[tuple[str, float], ...]
+    ambient_c: float = 12.0
+    coolant_start_c: float = 15.0
+    plateau_c: float = 88.0
+    warm_tau_s: float = 240.0
+    low_voltage: tuple[tuple[float, float, float], ...] = ()  # (t_from, t_to, volts) while running
+    step_drops: tuple[tuple[float, float], ...] = ()  # (t, drop V for 2 s)
+
+    def phase_at(self, t: float) -> tuple[str, float, float]:
+        """-> (phase, seconds into phase, engine-running seconds so far)."""
+        acc = 0.0
+        run = 0.0
+        for ph, dur in self.phases:
+            if t < acc + dur:
+                into = t - acc
+                return ph, into, run + (into if ph not in ("ign", "off") else 0.0)
+            acc += dur
+            if ph not in ("ign", "off"):
+                run += dur
+        return self.phases[-1][0], t - acc, run
+
+    def online(self, t: float) -> bool:
+        return self.phase_at(t)[0] != "off"
+
+    def _coolant(self, t: float) -> float:
+        ph, into, run = self.phase_at(t)
+        warm = self.coolant_start_c + (self.plateau_c - self.coolant_start_c) * (
+            1 - math.exp(-run / self.warm_tau_s)
+        )
+        if ph in ("ign", "off") and run > 0:  # heat soak after a stop, then slow cooling
+            warm += 3.0 * math.exp(-into / 120.0) * (1 - math.exp(-into / 20.0)) - into / 600.0
+        return warm
+
+    def _system_volts(self, t: float, running: bool, rng: random.Random) -> float:
+        if not running:
+            ph, into, run = self.phase_at(t)
+            v = 12.55 - (0.15 * (1 - math.exp(-into / 300.0)) if run > 0 else 0.0)
+        else:
+            v = 14.15
+            for a, b, volts in self.low_voltage:
+                if a <= t < b:
+                    v = volts
+        for at, drop in self.step_drops:
+            if at <= t < at + 2.0:
+                v -= drop
+        return v + rng.gauss(0, 0.02)
+
+    def adapter_volts(self, t: float) -> float:
+        ph = self.phase_at(t)[0]
+        rng = random.Random(int(t * 10))
+        return round(self._system_volts(t, ph not in ("ign", "off"), rng) - 0.15, 1)
+
+    def signals(self, t: float, rng: random.Random) -> dict[int, float]:
+        n = rng.gauss
+        ph, into, _ = self.phase_at(t)
+        running = ph not in ("ign", "off")
+        rpm = speed = load = maf = egr = 0.0
+        mapv = 101.0
+        if ph in ("idle", "regen"):
+            rpm, load, maf, egr, mapv = (
+                800 + n(0, 6),
+                20 + n(0, 1),
+                9.5 + n(0, 0.15),
+                38 + n(0, 1),
+                101 + n(0, 0.4),
+            )
+        elif ph == "city":
+            cyc = into % 90.0
+            speed = max(0.0, 50 * math.sin(math.pi * cyc / 60.0)) if cyc < 60 else 0.0
+            rpm = 800 + speed * 32 + n(0, 15)
+            load, maf, egr = (
+                25 + speed * 0.6 + n(0, 2),
+                9.5 + speed * 0.5 + n(0, 0.4),
+                max(0.0, 35 - speed * 0.3 + n(0, 1)),
+            )
+            mapv = 101 + speed * 0.9 + n(0, 1)
+        elif ph == "road":
+            speed = 110 + n(0, 2)
+            rpm, load, maf, egr, mapv = (
+                2200 + n(0, 30),
+                45 + n(0, 3),
+                48 + n(0, 2),
+                6 + n(0, 1),
+                165 + n(0, 3),
+            )
+        if ph == "regen":
+            rpm += 160
+            maf *= 1.45
+            egr = max(0.0, 1.0 + n(0, 0.5))
+        cool = self._coolant(t)
+        volts = self._system_volts(t, running, rng)
+        return {
+            0x04: load, 0x05: cool, 0x0B: mapv, 0x0C: max(0.0, rpm), 0x0D: speed, 0x0F: self.ambient_c + 8 + n(0, 0.3),
+            0x10: max(0.0, maf), 0x1F: 0.0 if not running else min(65535.0, into), 0x23: 30000 + rpm * 8 if running else 0,
+            0x2C: egr, 0x2D: n(0, 1.5) if running else 0.0, 0x33: 101, 0x42: volts, 0x46: self.ambient_c, 0x49: 0,
+        }  # fmt: skip
+
+
+def _drive(cycle: DriveCycle, **kw) -> dict:
+    return dict(signals=cycle.signals, ecu_online=cycle.online, adapter_voltage=cycle.adapter_volts, **kw)
+
+
+CITY = DriveCycle((("ign", 8), ("idle", 40), ("city", 540), ("idle", 30), ("ign", 30), ("off", 600)))
+HIGHWAY = DriveCycle(
+    (
+        ("ign", 8),
+        ("idle", 30),
+        ("city", 120),
+        ("road", 960),
+        ("city", 90),
+        ("idle", 20),
+        ("ign", 30),
+        ("off", 600),
+    ),
+    coolant_start_c=40.0,
+)
+WARMUP = DriveCycle((("ign", 8), ("idle", 900)), coolant_start_c=5.0, ambient_c=3.0, warm_tau_s=300.0)
+REGEN = DriveCycle((("ign", 5), ("idle", 420), ("regen", 300), ("idle", 300)), coolant_start_c=85.0)
+SHUTDOWN_IN_REGEN = DriveCycle(
+    (("ign", 5), ("idle", 420), ("regen", 180), ("ign", 25), ("off", 900)), coolant_start_c=85.0
+)
+VOLTAGE_DROP = DriveCycle(
+    (("ign", 8), ("idle", 40), ("city", 400), ("idle", 30), ("ign", 30), ("off", 300)),
+    low_voltage=((150.0, 230.0, 11.9),),
+    step_drops=((300.0, 1.6),),
+)
+IGNITION_OFF = DriveCycle((("ign", 5), ("idle", 60), ("ign", 20), ("off", 1200)), coolant_start_c=80.0)
+ECU_SILENT = DriveCycle((("ign", 5), ("idle", 60), ("off", 1200)), coolant_start_c=80.0)
+
+
 MINI = "mini-countryman-r60-diesel"
 PORSCHE = "porsche-boxster-986-mk2"
 
@@ -160,6 +307,23 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         Scenario("slow_adapter", "Synthetic healthy idle with slow adapter responses", MINI, _diesel(),
                  delay=(0.25, 0.6)),
+        Scenario("mini_city_drive", "Synthetic short urban drive, engine stop, ignition off", MINI, **_drive(CITY)),
+        Scenario("mini_highway_drive", "Synthetic drive with a long highway section", MINI, **_drive(HIGHWAY)),
+        Scenario("mini_warmup", "Synthetic cold start and warm-up at idle", MINI, **_drive(WARMUP)),
+        Scenario(
+            "mini_dpf_regen_possible", "Synthetic warm idle with an indirect regeneration-like pattern; DPF PIDs raw-only",
+            MINI, raw_only_pids=(0x7A, 0x7C, 0x78), **_drive(REGEN),
+        ),
+        Scenario(
+            "mini_shutdown_during_regen", "Synthetic regeneration-like pattern interrupted by an engine stop + ignition off",
+            MINI, raw_only_pids=(0x7A, 0x7C, 0x78), **_drive(SHUTDOWN_IN_REGEN),
+        ),
+        Scenario("mini_voltage_drop", "Synthetic drive with low running voltage and a sudden drop", MINI,
+                 **_drive(VOLTAGE_DROP)),
+        Scenario("mini_ignition_off", "Synthetic idle, engine stop, then the ECU stops answering", MINI,
+                 **_drive(IGNITION_OFF)),
+        Scenario("mini_ecu_silent_running", "Synthetic: the ECU stops answering while the engine was running",
+                 MINI, **_drive(ECU_SILENT)),
         Scenario(
             "porsche_healthy_idle", "Synthetic petrol flat-six idle over K-line (ISO 9141-2)", PORSCHE,
             _petrol_flat6(), family="kline", protocol_number="3", protocol_name="ISO 9141-2",
@@ -249,15 +413,19 @@ class ElmSimulator:
         elif cmd == "ATDPN":
             return ["A" + sc.protocol_number]
         elif cmd == "ATRV":
+            if sc.adapter_voltage is not None:
+                return [f"{sc.adapter_voltage(self._t()):.1f}V"]
             return ["14.1V"]
         else:
             return ["?"]
         return ["OK"]
 
     # -- OBD ------------------------------------------------------------------
+    def _t(self) -> float:
+        return self.clock.monotonic() - self.t0  # type: ignore[attr-defined]
+
     def _values(self) -> dict[int, float]:
-        t = self.clock.monotonic() - self.t0  # type: ignore[attr-defined]
-        return self.scenario.signals(t, self.rng)
+        return self.scenario.signals(self._t(), self.rng)
 
     def _engine_pids(self) -> set[int]:
         return set(self.scenario.signals(0.0, random.Random(0))) | {0x01} | set(self.scenario.raw_only_pids)
@@ -271,6 +439,8 @@ class ElmSimulator:
         if not body:
             return ["?"]
         mode, args = body[0], body[1:]
+        if sc.ecu_online is not None and not sc.ecu_online(self._t()):
+            return ["NO DATA"]  # ignition off / ECU asleep: nothing on the bus answers
         eng = "7E8" if sc.family == "can" else "10"
         msgs: list[tuple[str, bytes]] = []
         can = sc.family == "can"

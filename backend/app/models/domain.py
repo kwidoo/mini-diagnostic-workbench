@@ -111,15 +111,32 @@ class FreezeFrame(BaseModel):
     readings: list[Reading] = Field(default_factory=list)
 
 
+EventOrigin = Literal[
+    "manual",  # entered by a person (button, CLI); what they saw/heard, not a measurement
+    "observed",  # derived directly from a measured transition (e.g. RPM went from running to 0)
+    "inferred",  # heuristic interpretation of indirect evidence; never a confirmation
+]
+
+
 class Annotation(BaseModel):
+    """A point on the session timeline: a free-text marker, a predefined event or a link event.
+
+    Older sessions only have ``label`` / ``note`` (origin defaults to ``manual``).
+    """
+
     t_wall: float
     t_mono: float | None = None
     label: str
     note: str = ""
+    event_type: str | None = None  # predefined event id (e.g. fan_running), None for free text
+    origin: EventOrigin = "manual"
+    confidence: str | None = None  # e.g. "measured", "low", "moderate"; None for manual markers
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class PidMetrics(BaseModel):
     pid: int
+    mode: int = 1  # 1 = OBD service 01; 0 = adapter-measured (ATRV), not an ECU value
     name: str
     attempts: int
     ok: int

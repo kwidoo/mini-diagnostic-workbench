@@ -25,6 +25,22 @@ service or data identifiers.
 `ATZ` resets the adapter, not the car. `ATSP0` asks the adapter to auto-detect the
 protocol; on K-line vehicles that involves the normal OBD bus initialisation.
 
+## Continuous monitoring
+
+- No new request type: monitoring uses the same allowlisted generic OBD reads plus the
+  adapter-only `ATRV`. No DPF regeneration, fan activation, DTC clearing or adaptation
+  reset is possible, and no BMW-specific request exists.
+- When the ECU stops answering (typically ignition off) the recorder sends no vehicle
+  requests; it does not try to wake modules. Only the adapter voltage (`ATRV`, adapter-local)
+  is read. If the adapter's Wi-Fi drops meanwhile, the recorder only re-opens the TCP link and
+  sends `ATRV`: it never re-initialises the adapter (that would end with a `0100` probe on
+  the vehicle bus) and never sends a vehicle request to test the restored link. Vehicle
+  polling resumes only on an explicit user request (or an opt-in sparse probe); after an
+  adapter-only reconnect that request re-initialises the adapter first, and the dashboard
+  says so.
+- Loss of ECU communication is never recorded as "ignition off".
+- The dashboard is for a passenger or stationary use; the recording runs unattended.
+
 ## Using it safely
 
 - Default: vehicle stationary, parked safely, outdoors or well ventilated, ignition on

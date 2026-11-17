@@ -32,6 +32,9 @@ from app.obd.elm import (
     protocol_family,
 )
 from app.parameters.standard_pids import (
+    ADAPTER_MODE,
+    ADAPTER_VOLTAGE_NAME,
+    ADAPTER_VOLTAGE_PID,
     BITMAP_PIDS,
     PID_MONITOR_STATUS,
     PIDS,
@@ -143,6 +146,26 @@ def interpret_pid(mode: int, pid: int, decoded: Decoded) -> list[Reading]:
             r.detail = "ECU answered; no verified decoder in this tool, raw bytes kept"
         out.append(r)
     return out
+
+
+def interpret_adapter_voltage(ex: Exchange) -> Reading:
+    """ATRV exchange -> adapter-voltage Reading (mode 0). Live and replay use the same rule."""
+    _, reply, _, _ = decode_exchange(ex, "unsupported", None)
+    base = dict(
+        mode=ADAPTER_MODE,
+        pid=ADAPTER_VOLTAGE_PID,
+        name=ADAPTER_VOLTAGE_NAME,
+        unit="V",
+        t_wall=ex.t_wall,
+        t_mono=ex.t_mono,
+        latency_ms=ex.latency_ms,
+        raw_hex=ex.response_hex,
+    )
+    text = reply.text.strip()
+    if ex.status != "ok" or reply.status != ElmStatus.OK or not _VOLTAGE.fullmatch(text):
+        quality = "timeout" if ex.status in ("timeout", "cancelled") else "error"
+        return Reading(**base, quality=quality, detail=f"ATRV reply not usable ({ex.status}: {text!r})")  # type: ignore[arg-type]
+    return Reading(**base, value=float(text.upper().rstrip("V").strip()), text=text)
 
 
 def interpret_dtcs(kind: str, decoded: Decoded, family: str) -> tuple[list[Dtc], str]:
@@ -355,6 +378,50 @@ class ObdClient:
     # -- live data -----------------------------------------------------------------
     def read_pid(self, pid: int) -> list[Reading]:
         return interpret_pid(1, pid, self.query(AllowedCommand.obd(0x01, pid)))
+
+    def link_ready(self) -> bool:
+        """True when a request can go out on the current connection WITHOUT reconnecting or
+        re-initialising the adapter (re-initialisation sends a 0100 probe onto the vehicle bus)."""
+        t = self.transport
+        return (
+            self._initialised_once
+            and t.synced
+            and t.state == "connected"
+            and self._gen is not None
+            and t.generation == self._gen
+        )
+
+    def read_adapter_voltage(self, allow_reinit: bool = True) -> Reading | None:
+        """Adapter supply voltage via ATRV (an adapter command: nothing is sent to the vehicle bus).
+
+        Provenance is the adapter, not the ECU. With ``allow_reinit=False`` nothing is sent when the
+        link would first need a reconnect/re-initialisation; returns None (not attempted) then.
+        """
+        with self._lock:
+            if not allow_reinit and not self.link_ready():
+                return None
+            if not self._initialised_once:
+                raise ObdError("adapter not initialised")
+            if self.transport.prepare() != self._gen:
+                self.initialize()
+            ex = self.transport.send(AllowedCommand.at("ATRV"))
+        return interpret_adapter_voltage(ex)
+
+    def read_adapter_voltage_local(self) -> Reading:
+        """ATRV for a recording whose VEHICLE polling is paused (ECU unresponsive).
+
+        Adapter-local only: if the connection was lost it is re-opened (TCP / resync) but the
+        adapter is NOT re-initialised - re-initialisation ends with a 0100 probe on the vehicle
+        bus, which could wake sleeping modules. Only ATRV is sent; the connection stays
+        un-initialised, so any later vehicle request (an explicit resume) re-initialises first.
+        Raises TransportError when the adapter cannot be reached.
+        """
+        with self._lock:
+            if not self._initialised_once:
+                raise ObdError("adapter not initialised")
+            self.transport.prepare()  # reconnect/resync only; never initialize() here
+            ex = self.transport.send(AllowedCommand.at("ATRV"))
+        return interpret_adapter_voltage(ex)
 
     def snapshot(self) -> list[Reading]:
         out: list[Reading] = []

@@ -44,6 +44,19 @@ Below the workbench, `ObdClient` serialises re-init + request, and the transport
 serialises single wire exchanges and discards any connection whose reply stream is
 out of step (see DIAGNOSTIC_PROTOCOL.md, "Resynchronisation").
 
+## Monitoring recorder
+
+`app/acquisition/monitor.py` (`MonitoringRecorder`) is used for recording profiles
+with `tiers` (today: `mini_extended_monitoring`); the original round-robin `Recorder`
+is unchanged for the other profiles. It uses the same `ObdClient` (so the same lock,
+allowlist and transport resynchronisation), schedules signals by tier with
+earliest-deadline-first, adapts intervals to the measured adapter throughput, writes
+observed timeline events (engine start/stop, MIL, adapter link, ECU silence) and stops
+all vehicle requests while the ECU is silent. Analysis of monitoring sessions lives in
+`app/diagnostics/monitoring.py` and `app/diagnostics/rules/monitoring.py`. Annotations
+gained `event_type`, `origin`, `confidence` and `evidence` columns (additive
+migration). Adapter-measured ATRV samples use `mode = 0`. Details: MONITORING.md.
+
 ## Multi-vehicle separation
 
 | Concern | Where | Vehicle-specific? |
