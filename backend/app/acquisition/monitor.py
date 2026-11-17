@@ -24,6 +24,13 @@ timeline events (origin ``observed``):
   woken); only the adapter's own supply voltage (ATRV, adapter-local) is read,
   and only on the existing, already-initialised connection. Vehicle polling
   resumes when the user asks for it (or, opt-in, with a sparse backed-off probe);
+* while vehicle polling is paused the adapter link is still watched through ATRV. If
+  the Wi-Fi/TCP link drops then, the recorder records ``adapter_connection_lost``,
+  switches to ``adapter_unreachable`` (vehicle polling stays paused) and only tries
+  to reach the ADAPTER again: reconnect + ATRV, never an adapter re-initialisation
+  (which ends with a 0100 probe on the vehicle bus) and never a vehicle request. When
+  the adapter answers again it records ``adapter_connection_restored`` and returns to
+  ``ecu_unresponsive``; vehicle polling still needs an explicit resume;
 * ``engine_started`` / ``engine_stopped`` from measured RPM transitions, with a
   snapshot of the last valid RPM / coolant / ECU voltage / adapter voltage;
 * ``mil_on`` / ``mil_off`` from PID 01 transitions.
@@ -61,6 +68,7 @@ ADAPT_EVERY_S = 15.0  # adaptation window
 LOAD_BUDGET = 0.8  # use at most this share of the measured adapter capacity
 MAX_LOW_TIER_STRETCH = 4.0  # medium/slow are stretched up to this factor before the fast tier is touched
 BACKOFF_S = (2.0, 60.0)  # adapter unreachable: retry back-off (initial, max)
+ADAPTER_LOST_FAILS = 2  # consecutive unanswered ATRV reads (vehicle polling paused) = adapter link lost
 MAX_ADJUSTMENTS_KEPT = 200
 
 
@@ -102,6 +110,9 @@ class MonitorStats:
     ecu_probes: int = 0
     engine_stops_observed: int = 0
     ecu_losses: int = 0
+    adapter_losses: int = 0
+    adapter_losses_while_ecu_paused: int = 0
+    adapter_only_reconnects: int = 0
 
 
 STATES = ("running", "ecu_unresponsive", "adapter_unreachable")
@@ -153,6 +164,10 @@ class MonitoringRecorder:
         self._last_vehicle_ok: float | None = None
         self._adapter_lost_at: tuple[float, float] | None = None  # (t_wall, t_mono)
         self._ecu_lost_at: tuple[float, float] | None = None
+        # True from ecu_communication_lost until the ECU answers again (explicit/opt-in probe).
+        # While True no vehicle request is sent, whatever happens to the adapter link.
+        self.ecu_paused = False
+        self._adapter_fails = 0
         self._engine_stop_at: float | None = None
         self._window_start = self.clock.monotonic()
         self._busy = 0.0
@@ -219,6 +234,12 @@ class MonitoringRecorder:
                 for i in self.items
             },
             "resume_probe_s": self.resume_probe_s,
+            # vehicle polling paused because the ECU stopped answering (stays paused while the
+            # adapter is unreachable; only an explicit resume sends a vehicle request again)
+            "ecu_polling_paused": self.ecu_paused,
+            "adapter_link": "lost" if self._adapter_lost_at is not None else "ok",
+            # resuming will re-initialise the adapter first (ATZ ... 0100) on a new connection
+            "resume_requires_reinit": self.ecu_paused and not self.client.link_ready(),
         }
 
     def _publish(self) -> None:
@@ -363,23 +384,46 @@ class MonitoringRecorder:
             self._link_lost(r)
 
     def _link_ok(self, r: Reading) -> None:
+        self._adapter_fails = 0
         if self._adapter_lost_at is not None:
             lost_wall, lost_mono = self._adapter_lost_at
             self._adapter_lost_at = None
+            note = (
+                f"adapter link working again after {r.t_mono - lost_mono:.1f} s; no values exist for that gap"
+            )
+            if self.ecu_paused:
+                note += (
+                    ". Adapter-only reconnect (ATRV); the adapter was NOT re-initialised and no vehicle request "
+                    "was sent. Vehicle polling stays paused (the ECU was unresponsive) until you resume it."
+                )
             self._event(
                 "adapter_connection_restored",
-                f"adapter link working again after {r.t_mono - lost_mono:.1f} s; no values exist for that gap",
-                {"gap_s": round(r.t_mono - lost_mono, 2), "lost_at_wall": lost_wall},
+                note,
+                {
+                    "gap_s": round(r.t_mono - lost_mono, 2),
+                    "lost_at_wall": lost_wall,
+                    "ecu_polling_paused": self.ecu_paused,
+                },
                 at=(r.t_wall, r.t_mono),
             )
 
     def _link_lost(self, r: Reading) -> None:
         if self._adapter_lost_at is None:
             self._adapter_lost_at = (r.t_wall, r.t_mono)
+            self.stats.adapter_losses += 1
+            if self.ecu_paused:
+                self.stats.adapter_losses_while_ecu_paused += 1
+                note = (
+                    "adapter connection dropped (Wi-Fi/TCP) while vehicle polling was paused (ECU unresponsive). "
+                    "Only adapter-local reconnect attempts follow (ATRV); no vehicle request is sent and the "
+                    "adapter is not re-initialised."
+                )
+            else:
+                note = "adapter connection dropped (Wi-Fi/TCP); the recorder reconnects and re-initialises the adapter"
             self._event(
                 "adapter_connection_lost",
-                "adapter connection dropped (Wi-Fi/TCP); the recorder reconnects and re-initialises the adapter",
-                {"detail": r.detail, "while": self.state},
+                note,
+                {"detail": r.detail, "while": self.state, "ecu_polling_paused": self.ecu_paused},
                 at=(r.t_wall, r.t_mono),
             )
 
@@ -457,6 +501,8 @@ class MonitoringRecorder:
             at=(r.t_wall, r.t_mono),
         )
         self._fail_run = 0
+        self.ecu_paused = True
+        self._adapter_fails = 0
         self._probe_wait = self.resume_probe_s
         self._probe_at = (self.clock.monotonic() + self._probe_wait) if self._probe_wait else None
         self._set_state("ecu_unresponsive")
@@ -541,6 +587,9 @@ class MonitoringRecorder:
         self._adapt()
 
     def _step_unreachable(self) -> None:
+        if self.ecu_paused:
+            self._step_unreachable_paused()
+            return
         self._idle(self._backoff)
         if not self._live():
             return
@@ -556,6 +605,32 @@ class MonitoringRecorder:
             i.next_due = self.clock.monotonic()
         self._absorb(first, rs, t0)
 
+    def _read_adapter_paused(self) -> Reading | None:
+        """ATRV while vehicle polling is paused: adapter-local, may reconnect, never re-initialises.
+        Returns a 'disconnected' reading when the adapter cannot be reached."""
+        clock = self.clock
+        try:
+            return self.client.read_adapter_voltage_local()
+        except TransportError as exc:  # includes TransportClosedError
+            ex = getattr(exc, "exchange", None)
+            return Reading(
+                mode=0,
+                pid=ADAPTER_VOLTAGE_PID,
+                name="Adapter supply voltage (ATRV, measured by the adapter)",
+                unit="V",
+                t_wall=ex.t_wall if ex else clock.wall(),
+                t_mono=ex.t_mono if ex else clock.monotonic(),
+                quality="disconnected",
+                detail=str(exc),
+            )
+        except ObdError:
+            return None
+
+    def _adapter_unreachable_paused(self) -> None:
+        """Adapter link lost while vehicle polling is paused: stay paused, watch the adapter only."""
+        self._backoff = BACKOFF_S[0]
+        self._set_state("adapter_unreachable")
+
     def _step_ecu_lost(self) -> None:
         now = self.clock.monotonic()
         volt = next((i for i in self.items if i.pid is None), None)
@@ -570,12 +645,42 @@ class MonitoringRecorder:
             volt.next_due = now + volt.base_s  # base slow interval: nothing else competes for the link
             self.stats.adapter_voltage_attempts_while_ecu_lost += 1
             t0 = self.clock.monotonic()
-            r = self._read_adapter(allow_reinit=False)  # never reconnect/re-init (that sends 0100)
-            if r is not None:
-                self._absorb(volt, [r], t0)
+            # adapter-local: may re-open the TCP link, never re-initialises (that sends 0100)
+            r = self._read_adapter_paused()
+            if r is None:
+                return
+            self._absorb(volt, [r], t0)
+            if r.quality == "disconnected":
+                self._adapter_unreachable_paused()  # _absorb recorded adapter_connection_lost
+            elif r.quality == "timeout":
+                self._adapter_fails += 1
+                if self._adapter_fails >= ADAPTER_LOST_FAILS:
+                    self._link_lost(r)
+                    self._adapter_unreachable_paused()
             return
         waits = [x for x in (volt.next_due if volt else None, self._probe_at) if x is not None]
         self._idle(min(waits) - now if waits else 1.0)
+
+    def _step_unreachable_paused(self) -> None:
+        """Adapter unreachable while the ECU is unresponsive: back off, then try to reach the
+        ADAPTER (reconnect + ATRV). No vehicle request, no re-initialisation, no resume here."""
+        self.resume.clear()  # a resume cannot be honoured without an adapter; never queue it
+        self._idle(self._backoff)
+        if not self._live():
+            return
+        self._backoff = min(BACKOFF_S[1], self._backoff * 2)
+        volt = next((i for i in self.items if i.pid is None), None)
+        t0 = self.clock.monotonic()
+        r = self._read_adapter_paused()
+        if r is None or r.quality in ("disconnected", "timeout"):
+            return  # still unreachable (the loss is already recorded)
+        # the adapter answered (a value, or at least a complete reply): link is back
+        self.stats.adapter_only_reconnects += 1
+        self._link_ok(r)
+        if volt is not None:
+            self._absorb(volt, [r], t0)
+            volt.next_due = self.clock.monotonic() + volt.base_s
+        self._set_state("ecu_unresponsive")
 
     def _probe_ecu(self, manual: bool) -> None:
         """One vehicle request to see whether the ECU answers again (user-requested or opt-in)."""
@@ -584,15 +689,31 @@ class MonitoringRecorder:
         t0 = self.clock.monotonic()
         try:
             rs = self._read_pid(first.pid)  # type: ignore[arg-type]
-        except TransportError:
-            rs = []
+        except TransportError as exc:  # adapter unreachable: polling stays paused
+            self._link_lost(
+                Reading(
+                    pid=first.pid or 0,
+                    name=first.name,
+                    quality="disconnected",
+                    detail=str(exc),
+                    t_wall=self.clock.wall(),
+                    t_mono=self.clock.monotonic(),
+                )
+            )
+            self._adapter_unreachable_paused()
+            return
         if rs:
             self._busy += self.clock.monotonic() - t0
             self.on_readings(rs)
+        if rs and rs[0].quality == "disconnected":
+            self._link_lost(rs[0])
+            self._adapter_unreachable_paused()
+            return
         good = [r for r in rs if r.quality in GOOD]
         if good:
             lost_wall, lost_mono = self._ecu_lost_at or (good[0].t_wall, good[0].t_mono)
             self._ecu_lost_at = None
+            self.ecu_paused = False
             self._event(
                 "ecu_communication_restored",
                 f"the ECU answered again ({'probe requested by the user' if manual else 'opt-in periodic probe'}); "
@@ -652,6 +773,17 @@ class MonitoringRecorder:
             "suspended_at_end": dict(st.suspended),
             "time_in_state_s": {k: round(v, 2) for k, v in st.state_time_s.items()},
             "requests": st.requests,
+            "ecu_polling_paused_at_end": self.ecu_paused,
+            # connection-gap metadata: a link that was still down when the recording ended
+            "adapter_connection_lost_at_end": None
+            if self._adapter_lost_at is None
+            else {
+                "lost_at_wall": self._adapter_lost_at[0],
+                "open_gap_s": round(self.clock.monotonic() - self._adapter_lost_at[1], 2),
+            },
+            "adapter_connection_losses": st.adapter_losses,
+            "adapter_connection_losses_while_ecu_paused": st.adapter_losses_while_ecu_paused,
+            "adapter_only_reconnects": st.adapter_only_reconnects,
             "items": [
                 {
                     "key": i.key,

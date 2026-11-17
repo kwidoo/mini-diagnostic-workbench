@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { useWorkbench } from '../../stores/workbench'
 import type { Signal, VoltageSource } from '../../types'
 import LineChart from '../LineChart.vue'
+import { coords, timeDomain } from '../chart'
 import DataBadge from './DataBadge.vue'
 import DataLegend from './DataLegend.vue'
 import EventMarkerBar from './EventMarkerBar.vue'
@@ -22,10 +23,6 @@ watch(selected, (id) => id && wb.loadMonitoring(id), { immediate: true })
 const m = computed(() => (wb.monitoring && wb.monitoring.session_id === selected.value ? wb.monitoring : null))
 const series = computed(() => (wb.monitoringSeries?.session_id === selected.value ? wb.monitoringSeries : null))
 const sig = (hex: string): Signal | undefined => series.value?.signals.find((s) => s.hex === hex)
-const domain = computed<[number, number] | null>(() => {
-  const ts = (series.value?.signals ?? []).flatMap((s) => s.points.map((p) => p[0]))
-  return ts.length ? [Math.min(...ts), Math.max(...ts, Math.min(...ts) + 1)] : null
-})
 const markers = computed(() =>
   (series.value?.annotations ?? []).map((a) => ({ t: a.t, label: a.event_type ?? a.label, origin: a.origin ?? 'manual' })),
 )
@@ -34,6 +31,18 @@ const bands = computed(() =>
     .filter((r) => r.t_start_rel_s !== undefined && r.t_end_rel_s !== undefined)
     .map((r) => ({ from: r.t_start_rel_s as number, to: r.t_end_rel_s as number, label: 'possible regeneration (inferred)' })),
 )
+/** shared x range: every sample, failed read, event marker and inferred interval stays in view.
+ * Iterative (no spreading of large arrays into Math.min/max): safe for very long recordings. */
+const domain = computed<[number, number] | null>(() => {
+  const sigs = series.value?.signals ?? []
+  function* times() {
+    yield* coords(sigs.map((s) => s.points), 0)
+    for (const s of sigs) for (const f of s.failed) yield f[0]
+    for (const mk of markers.value) if (mk.t !== null) yield mk.t
+    for (const b of bands.value) { yield b.from; yield b.to }
+  }
+  return timeDomain(times())
+})
 const CHARTS = [
   { hex: '0D', title: 'Vehicle speed' },
   { hex: '0C', title: 'Engine speed' },

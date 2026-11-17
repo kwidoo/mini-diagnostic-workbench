@@ -17,6 +17,11 @@ export interface MonitorState {
   suspended: string[]
   items: Record<string, { tier: Tier; pid: number | null; interval_s: number }>
   resume_probe_s: number | null
+  /** vehicle polling paused after the ECU stopped answering (stays paused while the adapter is unreachable) */
+  ecu_polling_paused?: boolean
+  adapter_link?: 'ok' | 'lost'
+  /** an explicit resume re-initialises the adapter first (ATZ ... 0100) */
+  resume_requires_reinit?: boolean
 }
 export type Tier = 'fast' | 'medium' | 'slow'
 export interface TierIntervals { fast: number; medium: number; slow: number }
@@ -178,6 +183,8 @@ export interface MonitoringSummary {
 }
 export interface HistoryRow {
   id: string; started_at: number; label: string; synthetic: boolean; aborted: string | null; drive_type: string | null
+  /** whose references judged this row: 'real' and 'synthetic' sessions never share a baseline */
+  baseline_origin?: 'real' | 'synthetic'; interrupted?: boolean
   running_min: number; max_speed_kmh: number | null; engine_stops: number; fan_runs_after_shutdown: number
   fan_durations_s: (number | null)[]; battery_warnings: number; possible_regenerations: number
   possible_interrupted_regenerations: number; user_suspected_regenerations: number; coolant_max_c: number | null

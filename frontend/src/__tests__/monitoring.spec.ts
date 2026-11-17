@@ -87,6 +87,20 @@ describe('MINI monitoring: live', () => {
     expect(w.get('[data-test=mtile-12]').find('[data-test=stale]').exists()).toBe(true)
   })
 
+  it('shows a Wi-Fi loss while ECU polling is paused: no resume offered, stop and save still possible', async () => {
+    const st = { ...connected, recording: recording({ state: 'adapter_unreachable', engine: 'stopped', ecu_polling_paused: true, adapter_link: 'lost' }) }
+    const { w } = await mountWith(MonitoringLive, st)
+    expect(w.get('[data-test=link-text]').text()).toContain('no vehicle request')
+    expect(w.get('[data-test=adapter-lost-paused]').text()).toContain('stop and save')
+    expect(w.find('[data-test=resume-ecu]').exists()).toBe(false)
+  })
+
+  it('warns that resuming after an adapter-only reconnect re-initialises the adapter', async () => {
+    const st = { ...connected, recording: recording({ state: 'ecu_unresponsive', engine: 'stopped', ecu_polling_paused: true, resume_requires_reinit: true }) }
+    const { w } = await mountWith(MonitoringLive, st)
+    expect(w.get('[data-test=resume-reinit]').text()).toContain('ATZ')
+  })
+
   it('offers fan / battery events after the engine stopped and while the ECU is silent, without claiming ignition off', async () => {
     const st = { ...connected, recording: recording({ state: 'ecu_unresponsive', engine: 'stopped' }) }
     const { w, calls } = await mountWith(MonitoringLive, st, {
@@ -219,6 +233,20 @@ describe('MINI monitoring: session details and history', () => {
     expect(w.findAll('[data-test=marker][data-origin=observed]').length).toBeGreaterThan(0)
   })
 
+  it('never groups real and synthetic sessions together and flags recovered sessions', async () => {
+    const row = (id: string, synthetic: boolean, fan: number[], interrupted = false) => ({
+      id, started_at: 1, label: id, synthetic, baseline_origin: synthetic ? 'synthetic' : 'real', aborted: interrupted ? 'interrupted: ...' : null,
+      interrupted, drive_type: 'city', running_min: 12, max_speed_kmh: 50, engine_stops: 1, fan_runs_after_shutdown: fan.length, fan_durations_s: fan,
+      battery_warnings: 0, possible_regenerations: 0, possible_interrupted_regenerations: 0, user_suspected_regenerations: 0, coolant_max_c: 88,
+      ecu_voltage_running_median: 14.1, adapter_voltage_running_median: 13.9, link_events: 0,
+    })
+    const hist = { sessions: [row('r1', false, [100], true), row('s1', true, [400]), row('s2', true, [600])] }
+    const { w } = await mountWith(MonitoringHistory, connected, { 'GET /api/monitoring/history': hist })
+    expect(w.get('[data-test=group-real-city]').text()).toContain('100 s')
+    expect(w.get('[data-test=group-synthetic-city]').text()).toContain('500 s')
+    expect(w.get('[data-test=history-r1]').find('[data-test=interrupted]').exists()).toBe(true)
+  })
+
   it('compares drives grouped by the user drive-type label', async () => {
     const row = (id: string, t: string, fan: number[]) => ({
       id, started_at: 1, label: id, synthetic: false, aborted: null, drive_type: t, running_min: 12, max_speed_kmh: 50, engine_stops: 1,
@@ -228,8 +256,8 @@ describe('MINI monitoring: session details and history', () => {
     })
     const hist = { sessions: [row('a', 'city', [240]), row('b', 'city', [180]), row('c', 'highway', [])] }
     const { w } = await mountWith(MonitoringHistory, connected, { 'GET /api/monitoring/history': hist })
-    expect(w.get('[data-test=group-city]').text()).toContain('210 s')
-    expect(w.get('[data-test=group-highway]').text()).toContain('n/a')
+    expect(w.get('[data-test=group-real-city]').text()).toContain('210 s')
+    expect(w.get('[data-test=group-real-highway]').text()).toContain('n/a')
     expect(w.findAll('[data-test^=history-]').filter((x) => x.element.tagName === 'TR').length).toBe(3)
     await w.get('[data-test=history-filter]').setValue('highway')
     expect(w.find('[data-test=history-a]').exists()).toBe(false)

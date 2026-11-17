@@ -407,6 +407,22 @@ class ObdClient:
             ex = self.transport.send(AllowedCommand.at("ATRV"))
         return interpret_adapter_voltage(ex)
 
+    def read_adapter_voltage_local(self) -> Reading:
+        """ATRV for a recording whose VEHICLE polling is paused (ECU unresponsive).
+
+        Adapter-local only: if the connection was lost it is re-opened (TCP / resync) but the
+        adapter is NOT re-initialised - re-initialisation ends with a 0100 probe on the vehicle
+        bus, which could wake sleeping modules. Only ATRV is sent; the connection stays
+        un-initialised, so any later vehicle request (an explicit resume) re-initialises first.
+        Raises TransportError when the adapter cannot be reached.
+        """
+        with self._lock:
+            if not self._initialised_once:
+                raise ObdError("adapter not initialised")
+            self.transport.prepare()  # reconnect/resync only; never initialize() here
+            ex = self.transport.send(AllowedCommand.at("ATRV"))
+        return interpret_adapter_voltage(ex)
+
     def snapshot(self) -> list[Reading]:
         out: list[Reading] = []
         for pid in sorted(self._caps().supported_mode01()):

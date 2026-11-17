@@ -24,8 +24,8 @@ from app.acquisition.recorder import GOOD
 from app.adapters.base import TransportError
 from app.adapters.simulator import SCENARIOS
 from app.adapters.tcp import DEFAULT_HOST, DEFAULT_PORT
-from app.diagnostics.engine import analyze_session, load_session
-from app.diagnostics.monitoring import history_row, is_monitoring_session, references, summary_for
+from app.diagnostics.engine import analyze_session
+from app.diagnostics.monitoring import history_for, summary_for
 from app.obd.client import ObdError
 from app.parameters.standard_pids import ADAPTER_MODE, ADAPTER_VOLTAGE_NAME, PIDS, RAW_ONLY_PIDS, pid_name
 from app.service import BusyError, NotConnectedError, Workbench
@@ -355,16 +355,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/monitoring/history")
     def monitoring_history(vehicle: str | None = None) -> dict[str, Any]:
-        prof = vehicle or wb.profile.id
-        sessions = [
-            load_session(store, s["id"]) for s in store.list_sessions(prof) if is_monitoring_session(s)
-        ]
-        refs = references(sessions)
-        return {
-            "vehicle_profile": prof,
-            "references": {"usual_warm_coolant": refs["plateau"], "warm_idle_baseline": refs["baseline"]},
-            "sessions": [history_row(sd, refs) for sd in reversed(sessions)],
-        }
+        # real and synthetic sessions (and different confirmed vehicles) never share a baseline
+        return history_for(store, vehicle or wb.profile.id)
 
     @app.get("/api/sessions/{sid}/export")
     def export(sid: str, include_vin: bool = False) -> Response:

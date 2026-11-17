@@ -521,4 +521,7 @@ def test_monitoring_fixture_replays_offline(store):
         assert m["is_monitoring_session"] and m["synthetic"]
         assert m["fan"]["runs"][0]["complete"] and m["fan"]["runs"][0]["after_shutdown"]
         assert m["voltage"]["adapter"]["status"] == "measured"
-        assert [s["origin"] for s in m["shutdowns"]] == ["observed", "manual"]
+        # observed stop + manual ignition-off marker = ONE shutdown episode (task 5)
+        assert [s["origin"] for s in m["shutdowns"]] == ["observed"]
+        ep = m["shutdowns"][0]
+        assert ep["engine_stop"]["origin"] == "observed" and ep["ignition_off"]["origin"] == "manual"

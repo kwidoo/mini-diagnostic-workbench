@@ -76,7 +76,9 @@ const linkText = computed(() => {
     case 'ecu_unresponsive':
       return 'ECU not answering: vehicle polling paused (not proof that the ignition is off); adapter voltage only'
     case 'adapter_unreachable':
-      return 'Adapter unreachable: retrying with back-off; the gap is recorded'
+      return mon.value?.ecu_polling_paused
+        ? 'Adapter unreachable while vehicle polling was paused: retrying the adapter only (no vehicle request); the gap is recorded'
+        : 'Adapter unreachable: retrying with back-off; the gap is recorded'
     default:
       return 'n/a'
   }
@@ -148,6 +150,13 @@ const chartPoints = (key: number) => wb.live[key]?.points ?? []
       <div v-if="mon?.state === 'ecu_unresponsive'" class="mt-2 flex flex-wrap items-center gap-2" data-test="ecu-paused">
         <button class="btn" data-test="resume-ecu" @click="wb.resumeEcuPolling()">Check whether the ECU answers (one request)</button>
         <span class="text-xs text-ink-2">Use this after switching the ignition back on. Sleeping modules are not polled or woken otherwise.</span>
+        <span v-if="mon?.resume_requires_reinit" class="text-xs text-warn" data-test="resume-reinit">
+          The adapter connection was re-opened while polling was paused: checking re-initialises the adapter first (ATZ ... 0100).
+        </span>
+      </div>
+      <div v-else-if="mon?.state === 'adapter_unreachable' && mon?.ecu_polling_paused" class="mt-2 text-xs text-warn" data-test="adapter-lost-paused">
+        The adapter's Wi-Fi link is down. Vehicle polling stays paused and nothing is sent to the car; the recorder only tries to reach
+        the adapter again. You can stop and save the recording at any time: everything captured so far is kept.
       </div>
     </section>
 

@@ -28,8 +28,15 @@ uv run mini-obd record --profile mini_extended_monitoring --until-stop \
 - A session holds a lease that is refreshed every 10 s. A session left open by a
   process that died (crash, kill, power loss) is closed on the next start of `serve`
   or of any CLI command: end time = last stored record, `aborted` = "interrupted",
-  metrics computed, data kept. A session whose lease is still fresh (a recording in
-  another process) is left alone.
+  `interrupted: true`, metrics computed, data kept. A session whose lease is still fresh
+  (a recording in another process) is left alone.
+- The recording settings (`recording_profile`, `selected`, `sampling_plan`,
+  `user_labels`, `until_stop`, `requested_duration_s`, `max_duration_s`) are written to
+  the session **when it is created, before the pre-scan or the first sample**. A session
+  recovered after a crash therefore still appears in monitoring history, keeps its
+  settings, and can be analysed and exported with the monitoring files. Recovery merges
+  into that metadata; it never replaces it. A drive-type label changed during the
+  recording is not overwritten when the recording ends.
 - Session metadata keeps the vehicle profile, adapter info, ECU capabilities, the
   selected signals per tier, requested-but-unsupported signals, the raw ELM transcript,
   final link diagnostics and a `monitoring` summary of what the recorder did.
@@ -114,6 +121,36 @@ Whether the ECU answered after the engine stop, for how long, and whether ATRV w
 readable afterwards is stored per session under `monitoring.observed_capabilities`:
 what the session showed, not an assumption. The fan is never detected; only markers.
 
+### Adapter Wi-Fi lost while vehicle polling is paused
+
+While the ECU is unresponsive the ATRV reads also watch the adapter link. If the
+Wi-Fi/TCP connection drops (a cut connection, or two ATRV reads in a row without an
+answer), the recorder writes `adapter_connection_lost` (evidence
+`ecu_polling_paused: true`) and switches to `adapter_unreachable`. Vehicle polling stays
+paused. With back-off it only tries to reach the **adapter**: re-open the TCP
+connection and send ATRV. The adapter is **not** re-initialised (initialisation ends
+with a `0100` probe on the vehicle bus) and no vehicle request is sent. When the adapter
+answers, `adapter_connection_restored` is written with the gap and the recorder returns
+to `ecu_unresponsive`. The "check whether the ECU answers" button is not offered while
+the adapter is unreachable; after an adapter-only reconnect the dashboard says that the
+check re-initialises the adapter first (ATZ ... 0100), and it is only sent when you ask.
+You can stop and save at any time. A gap still open at the end is stored as
+`monitoring.adapter_connection_lost_at_end` (with `open_gap_s`), together with
+`adapter_connection_losses(_while_ecu_paused)` and `adapter_only_reconnects`.
+
+### Shutdown episodes
+
+One physical shutdown often leaves several markers: the observed `engine_stopped`, your
+own `engine_stopped` and `ignition_off`, and later the observed `ecu_communication_lost`.
+They are grouped into **one shutdown episode**: markers within 300 s of each other, with
+no engine start (measured, or your `engine_started` marker) in between. The anchor is
+the observed engine stop when there is one, otherwise the earliest manual marker. Each
+episode lists the events it groups with their own times and origins (`events`,
+`engine_stop`, `ignition_off`, `ecu_communication_lost`); the original events all stay in
+the timeline. ECU silence is attached to the shutdown it follows but never creates a
+shutdown on its own. Fan runs, post-shutdown coolant/voltage and possibly interrupted
+regenerations are reported per episode, and history counts episodes, not markers.
+
 ## Analysis (P1)
 
 All screening values live in `backend/app/diagnostics/monitoring.py` (`HEURISTICS`,
@@ -134,6 +171,15 @@ car's own history, not BMW / MINI limits.
   sessions with >= 20 min running): did not reach it (>= 10 degC below), dropped by
   >= 10 degC after warm-up, or repeatedly >= 8 degC above it. Without history only the
   curve is reported.
+- **References are never pooled across data origins.** The usual warm coolant
+  temperature and the warm-idle RPM / MAF / EGR baseline of a session come only from
+  monitoring sessions of the same *cohort*: same vehicle profile, same origin (real
+  adapter vs simulator; a replay keeps the origin of the recording it came from) and the
+  same confirmed vehicle identity (a VIN actually read, or an explicit
+  `vehicle_identity`; nothing is assumed). Adding or removing synthetic recordings does
+  not change a real car's references or findings. History rows carry `baseline_origin`;
+  `/api/monitoring/history` returns `references` (the real car's, or the synthetic ones
+  if there is no real data) and `references_by_cohort` (identities only as a digest).
 - **Electrical**: as listed under Voltage, plus "no charging rise seen" (running median
   not 0.3 V above the engine-off median) and running samples below 12.2 V (screen only).
 - Findings `monitoring_*` appear only for monitoring sessions and never exceed

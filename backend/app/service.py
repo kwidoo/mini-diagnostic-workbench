@@ -359,7 +359,9 @@ class Workbench:
             self.store.update_session(
                 sid,
                 ended_at=ended,
+                # merged into the meta persisted at session start (recording settings are kept)
                 meta={
+                    "interrupted": True,
                     "aborted": "interrupted: the application stopped before the session was closed; "
                     "data up to the last stored record is kept",
                     "recovered": {"at": time.time(), "last_record_wall": last, "lease": lease},
@@ -469,6 +471,13 @@ class Workbench:
                     if use_atrv
                     else ("adapter did not answer ATRV" if rp.adapter_voltage else "not requested"),
                 }
+            # Persist the recording settings NOW, before the pre-scan or the first sample: if the
+            # process dies mid-recording, the recovered session still knows it is a monitoring
+            # session and how it was recorded (profile, signals, sampling plan, labels, limits).
+            self.store.update_session(sid, meta=dict(meta))
+            # user labels are owned by the store from here on (set_drive_type may change them
+            # while recording); the final meta write must not overwrite a newer label
+            meta.pop("user_labels", None)
             self.active = {
                 "session_id": sid,
                 "started_at": clock.wall(),
@@ -569,11 +578,25 @@ class Workbench:
         act = self.active
         if not act or not act.get("monitoring"):
             raise NotConnectedError("no monitoring recording is running")
-        state = (act.get("monitor") or {}).get("state")
+        mon = act.get("monitor") or {}
+        state = mon.get("state")
+        if state == "adapter_unreachable" and mon.get("ecu_polling_paused"):
+            return {
+                "requested": False,
+                "state": state,
+                "detail": "the adapter is unreachable; vehicle polling stays paused. The recorder retries the "
+                "adapter only (no vehicle request). Check the adapter's Wi-Fi, or stop and save the recording.",
+            }
         if state != "ecu_unresponsive":
             return {"requested": False, "state": state, "detail": "vehicle polling is not paused"}
         self._resume.set()
-        return {"requested": True, "state": state}
+        out: dict[str, Any] = {"requested": True, "state": state}
+        if mon.get("resume_requires_reinit"):
+            # the link was re-opened adapter-only while paused: the probe re-initialises first
+            out["detail"] = (
+                "the adapter is re-initialised first (ATZ ... 0100), then one vehicle request is sent"
+            )
+        return out
 
     def set_drive_type(self, sid: str, drive_type: str | None) -> dict[str, Any]:
         """User label city / highway / mixed / other (or None to clear). Stored in session meta."""

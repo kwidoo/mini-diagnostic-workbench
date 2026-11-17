@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { Point } from '../types'
-import { nearest, niceTicks, segments } from './chart'
+import { coords, drawSegments, extent, nearest, niceTicks, timeDomain } from './chart'
 
 export interface ChartSeries { label: string; color: string; points: Point[] }
 const props = withDefaults(
@@ -24,31 +24,46 @@ const W = 720
 const M = { l: 52, r: 12, t: 8, b: 22 }
 const hoverT = ref<number | null>(null)
 
-const all = computed(() => props.series.flatMap((s) => s.points))
-const empty = computed(() => all.value.length === 0)
+// Domains are computed iteratively over the ORIGINAL points (no array spreading: safe for
+// hundreds of thousands of samples). Only the drawn path is decimated, never the data.
+const empty = computed(() => props.series.every((s) => s.points.length === 0))
 const xDomain = computed<[number, number]>(() => {
   if (props.domain) return props.domain
-  const ts = [...all.value.map((p) => p[0]), ...props.failed.map((f) => f[0])]
-  return ts.length ? [Math.min(...ts), Math.max(...ts, Math.min(...ts) + 1)] : [0, 1]
+  function* times() {
+    yield* coords(props.series.map((s) => s.points), 0)
+    for (const f of props.failed) yield f[0]
+  }
+  return timeDomain(times()) ?? [0, 1]
 })
 const yDomain = computed<[number, number]>(() => {
-  const vs = all.value.map((p) => p[1])
-  if (!vs.length) return [0, 1]
-  const lo = Math.min(...vs)
-  const hi = Math.max(...vs)
+  const e = extent(coords(props.series.map((s) => s.points), 1))
+  if (!e) return [0, 1]
+  const [lo, hi] = e
   const pad = (hi - lo || Math.abs(hi) || 1) * 0.08
   return [lo - pad, hi + pad]
 })
+/** per-series min / max / last of the original data (data table) */
+const stats = computed(() =>
+  props.series
+    .filter((s) => s.points.length)
+    .map((s) => ({ label: s.label, n: s.points.length, range: extent(coords([s.points], 1)), last: s.points[s.points.length - 1][1] })),
+)
 const x = (t: number) => M.l + ((t - xDomain.value[0]) / (xDomain.value[1] - xDomain.value[0])) * (W - M.l - M.r)
 const y = (v: number) => props.height - M.b - ((v - yDomain.value[0]) / (yDomain.value[1] - yDomain.value[0])) * (props.height - M.t - M.b)
 const yTicks = computed(() => niceTicks(yDomain.value[0], yDomain.value[1], 3))
 const xTicks = computed(() => niceTicks(xDomain.value[0], xDomain.value[1], 6))
+/** drawn points per series: at most ~DRAW_BUDGET x 4 (deterministic min/max decimation, gaps kept) */
+const DRAW_BUDGET = 1500
 const paths = computed(() =>
-  props.series.map((s) => ({
-    ...s,
-    d: segments(s.points).map((seg) => seg.map((p, i) => `${i ? 'L' : 'M'}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join('')).join(''),
-    dots: segments(s.points).filter((seg) => seg.length === 1).map((seg) => seg[0]),
-  })),
+  props.series.map((s) => {
+    const segs = drawSegments(s.points, DRAW_BUDGET)
+    return {
+      ...s,
+      d: segs.map((seg) => seg.map((p, i) => `${i ? 'L' : 'M'}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join('')).join(''),
+      dots: segs.filter((seg) => seg.length === 1).map((seg) => seg[0]),
+      drawn: segs.reduce((n, seg) => n + seg.length, 0),
+    }
+  }),
 )
 const hover = computed(() => {
   if (hoverT.value === null || empty.value) return null
@@ -62,7 +77,8 @@ function onMove(e: MouseEvent) {
   const px = ((e.clientX - box.left) / (box.width || W)) * W
   hoverT.value = xDomain.value[0] + ((px - M.l) / (W - M.l - M.r)) * (xDomain.value[1] - xDomain.value[0])
 }
-const fmt = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2))
+const fmt = (v: number | null | undefined) =>
+  v === null || v === undefined || !Number.isFinite(v) ? 'n/a' : (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2))
 </script>
 
 <template>
@@ -97,7 +113,7 @@ const fmt = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 
         >{{ m.label }}</text>
       </g>
       <g v-for="p in paths" :key="p.label">
-        <path :d="p.d" fill="none" :stroke="p.color" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" data-test="line" />
+        <path :d="p.d" fill="none" :stroke="p.color" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" data-test="line" :data-drawn="p.drawn" :data-samples="p.points.length" />
         <circle v-for="(d, i) in p.dots" :key="i" :cx="x(d[0])" :cy="y(d[1])" r="2.5" :fill="p.color" />
       </g>
       <g data-test="failed">
@@ -124,10 +140,10 @@ const fmt = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 
       <table class="mt-1 w-full text-left">
         <thead><tr><th>Series</th><th>Samples</th><th>Min</th><th>Max</th><th>Last</th></tr></thead>
         <tbody>
-          <tr v-for="s in series.filter((q) => q.points.length)" :key="s.label">
-            <td>{{ s.label }}</td><td>{{ s.points.length }}</td>
-            <td>{{ fmt(Math.min(...s.points.map((p) => p[1]))) }}</td><td>{{ fmt(Math.max(...s.points.map((p) => p[1]))) }}</td>
-            <td>{{ fmt(s.points[s.points.length - 1][1]) }}</td>
+          <tr v-for="s in stats" :key="s.label" data-test="stats-row">
+            <td>{{ s.label }}</td><td>{{ s.n }}</td>
+            <td>{{ fmt(s.range?.[0]) }}</td><td>{{ fmt(s.range?.[1]) }}</td>
+            <td>{{ fmt(s.last) }}</td>
           </tr>
         </tbody>
       </table>
