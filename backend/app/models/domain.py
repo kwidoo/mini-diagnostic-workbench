@@ -83,6 +83,18 @@ class Reading(BaseModel):
     t_wall: float = 0.0
     t_mono: float = 0.0
     latency_ms: float = 0.0
+    # -- provenance of manufacturer readings (DDE-05); None for generic OBD / adapter readings --
+    source: str | None = None  # "bmw_dde"
+    signal_key: str | None = None  # stable key, e.g. "dpf_soot_mass" (never a generic PID)
+    request_id: str | None = None
+    decoder_version: str | None = None
+    catalog_version: str | None = None
+    status: dict[str, Any] | None = None  # decoded status semantics from a verified layout
+
+
+#: ``Reading.mode`` of manufacturer readings: outside every OBD service number, so they can never be
+#: mistaken for service 01 (mode 1) or adapter (mode 0) samples. Identify them by ``signal_key``.
+MANUFACTURER_MODE = 0x100
 
 
 class Dtc(BaseModel):

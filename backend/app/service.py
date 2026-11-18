@@ -412,6 +412,19 @@ class Workbench:
         with self._session("snapshot", label) as (sid, client, meta):
             self._phase = "inventory"
             self._flush(client.snapshot())
+            rt = self.dde_runtime()
+            if rt is not None:
+                # DDE-05: each executable manufacturer live signal once (none for the real car today)
+                from app.manufacturer.bmw.live import DdeLiveReader
+
+                self._phase = "dde:inventory"
+                live = DdeLiveReader(rt)
+                self._flush(live.snapshot())
+                meta["dde_live"] = {
+                    "catalog_version": rt.catalog.version,
+                    "synthetic": rt.ctx.synthetic_session,
+                    "availability": live.availability(),
+                }
             self._phase = "info"
             meta["vehicle_info"] = client.vehicle_info(read_vin)
             meta["monitors"] = client.monitors()

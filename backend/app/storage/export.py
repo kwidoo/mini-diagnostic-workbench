@@ -42,14 +42,26 @@ def _iso(t: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t)) if t else "n/a"
 
 
+#: appended only when a session has manufacturer readings (DDE-05)
+PROVENANCE_COLUMNS = [
+    "source",
+    "signal_key",
+    "request_id",
+    "decoder_version",
+    "catalog_version",
+    "status_json",
+]
+
+
 def samples_csv(samples: list[dict[str, Any]]) -> str:
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(SAMPLE_COLUMNS)
+    cols = SAMPLE_COLUMNS + (PROVENANCE_COLUMNS if any("source" in s for s in samples) else [])
+    w.writerow(cols)
     t0 = min((s["t_mono"] for s in samples), default=0.0)
     for s in samples:
         row = dict(s, t_rel_s=round(s["t_mono"] - t0, 4), pid=f"{s['pid']:02X}")
-        w.writerow(["" if row[c] is None else row[c] for c in SAMPLE_COLUMNS])
+        w.writerow(["" if row.get(c) is None else row[c] for c in cols])
     return buf.getvalue()
 
 

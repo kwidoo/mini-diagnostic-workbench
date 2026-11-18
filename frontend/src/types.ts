@@ -70,6 +70,9 @@ export interface VehicleRecord { confirmed: Record<string, string>; owner_report
 export interface Reading {
   mode: number; pid: number; ecu: string | null; name: string; unit: string | null; value: number | null
   text: string | null; raw_hex: string; quality: string; detail: string | null; t_wall: number; t_mono: number; latency_ms: number
+  /** DDE-05 provenance: present only on manufacturer readings (mode 0x100) */
+  source?: string; signal_key?: string; request_id?: string; decoder_version?: string; catalog_version?: string
+  status_json?: string
 }
 export interface Dtc { code: string; raw_hex: string; kind: string; ecu: string | null }
 export interface FreezeFrame { status: string; dtc: string | null; dtc_raw_hex: string | null; ecu: string | null; readings: Reading[] }

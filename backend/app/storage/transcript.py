@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame
+from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame, Reading
 from app.obd.allowlist import AllowedCommand, ForbiddenRequestError
 from app.obd.client import (
     DTC_MODES,
@@ -71,6 +71,11 @@ def transcript_lines(store: Store, sid: str, include_vin: bool = False) -> list[
         lines.append(json.dumps({"type": "exchange", **ex}, sort_keys=True))
     for a in store.annotations(sid):
         lines.append(json.dumps({"type": "annotation", **a.model_dump()}, sort_keys=True))
+    # manufacturer readings (DDE-05) are carried as decoded at recording time, with their decoder and
+    # catalog versions: replay never re-decodes manufacturer bytes with another layout
+    for smp in store.samples(sid):
+        if smp.get("source"):
+            lines.append(json.dumps({"type": "manufacturer_reading", **smp}, sort_keys=True))
     return lines
 
 
@@ -98,6 +103,14 @@ def ingest_transcript(
         for r in records
         if r["type"] == "annotation"
     ]
+    mfr_readings = []
+    for r in records:
+        if r["type"] != "manufacturer_reading":
+            continue
+        d = {k: v for k, v in r.items() if k != "type"}
+        st = d.pop("status_json", None)
+        d["status"] = json.loads(st) if st else None
+        mfr_readings.append(Reading(**d))
     started = exchanges[0].t_wall if exchanges else 0.0
     ended = exchanges[-1].t_wall if exchanges else 0.0
 
@@ -177,6 +190,7 @@ def ingest_transcript(
     )
     store.add_exchanges(sid, exchanges)
     store.add_samples(sid, samples)
+    store.add_samples(sid, mfr_readings)
     for scan in scans.values():
         store.add_scan(sid, scan)
     for a in annotations:

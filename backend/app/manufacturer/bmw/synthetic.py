@@ -111,6 +111,7 @@ def _entry(metric: str, did: str, decoder: str, unit, rng, interval: float, prio
         synthetic=True,
         evidence=("synthetic: served by the fake ELM327; no relation to a real DDE",),
         sample_interval_s=interval,
+        semantics="regeneration_active_flag" if metric == "dpf_regeneration_active" else None,
     )
 
 
