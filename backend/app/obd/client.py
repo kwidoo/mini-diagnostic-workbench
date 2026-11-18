@@ -198,6 +198,9 @@ class ObdClient:
         self.probe_timeout_s = 15.0  # the 0100 bootstrap probe: protocol search can take seconds
         self.adapter = AdapterInfo()
         self.capabilities: Capabilities | None = None
+        self.dde_unsupported: str | None = (
+            None  # DDE-03: adapter proved unable to address the DDE (this connection)
+        )
         self.family = "unsupported"
         self._gen: int | None = None
         self._initialised_once = False  # a failed re-init is retried on the next query
@@ -390,6 +393,16 @@ class ObdClient:
             and self._gen is not None
             and t.generation == self._gen
         )
+
+    def manufacturer_exchange(self, approved, timeout_s: float | None = None) -> list[Exchange] | None:
+        """DDE-03: send one ApprovedRequest transaction (set-up, request, restore) on the CURRENT,
+        already-initialised connection. Never reconnects or re-initialises for it: returns None
+        (not attempted) when the link would first need that - generic polling re-initialises the
+        adapter under the existing rules, a manufacturer read never triggers it."""
+        with self._lock:
+            if not self.link_ready():
+                return None
+            return self.transport.send_manufacturer(approved, timeout_s)
 
     def read_adapter_voltage(self, allow_reinit: bool = True) -> Reading | None:
         """Adapter supply voltage via ATRV (an adapter command: nothing is sent to the vehicle bus).

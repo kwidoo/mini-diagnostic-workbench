@@ -44,6 +44,50 @@ def _owner_codes(ctx: AnalysisContext) -> set[str]:
     return {c["code"].upper() for c in ctx.owner_reported.get("manufacturer_fault_codes", [])}
 
 
+def _dde_reads(sd: SessionData) -> list[tuple[str, Any]]:
+    """(scan phase, ManufacturerFaultRead) for every scan of this session that carried a DDE read."""
+    return [(sc.phase, sc.manufacturer) for sc in sd.scans if sc.manufacturer is not None]
+
+
+def _apply_measured_dde(f: Finding, sd: SessionData, code: str) -> bool:
+    """DDE-04: a measured BMW DDE fault-memory read supports / contradicts the code; an attempt
+    that did not complete says nothing (and is stated as such). Returns True if measured present."""
+    reads = _dde_reads(sd)
+    present = False
+    for phase, rd in reads:
+        tag = " (SYNTHETIC simulator data)" if rd.synthetic else ""
+        hits = [x for x in rd.faults if x.code.upper() == code]
+        if hits and rd.status in ("read", "partial"):
+            present = True
+            f.supporting.append(
+                Evidence(
+                    text=f"BMW DDE fault memory ({phase} scan) lists {code} as returned by the ECU, status byte "
+                    f"{hits[0].status_raw}{tag}.",
+                    values={
+                        "code": code,
+                        "status_raw": hits[0].status_raw,
+                        "status": hits[0].status,
+                        "read_status": rd.status,
+                        "decoder_version": rd.decoder_version,
+                    },
+                )  # fmt: skip
+            )
+        elif rd.status == "no_faults" or (rd.status == "read" and not hits):
+            f.contradicting.append(
+                Evidence(
+                    text=f"A complete BMW DDE fault-memory read ({phase} scan) did not list {code}{tag}.",
+                    values={"read_status": rd.status},
+                )
+            )
+        else:
+            f.conditions.append(
+                f"BMW DDE fault memory ({phase} scan): {rd.status.replace('_', ' ')}"
+                + (f" - {rd.detail}" if rd.detail else "")
+                + ". No statement about the code from this attempt."
+            )
+    return present
+
+
 def _support_line(sd: SessionData, pid: int, name: str) -> str:
     sup = sd.supported(pid)
     state = (
@@ -460,7 +504,12 @@ def dpf_480a(ctx: AnalysisContext) -> list[Finding]:
         ],
     )
     if "480A" in _owner_codes(ctx):
-        f.conditions.insert(0, "Owner-reported BMW fault 480A (not read by this tool).")
+        f.conditions.insert(
+            0,
+            "Owner-reported BMW fault 480A (history, not read by this tool; kept separate from any measured read).",
+        )
+    if _apply_measured_dde(f, sd, "480A"):
+        f.strength = "suggestive"
     advertised = [f"{n} (PID {p:02X})" for p, n in DPF_PIDS.items() if sd.supported(p)]
     if advertised:
         f.conditions.append(
@@ -490,9 +539,11 @@ def dpf_480a(ctx: AnalysisContext) -> list[Finding]:
 
 
 def dde_4862(ctx: AnalysisContext) -> list[Finding]:
-    if "4862" not in _owner_codes(ctx):
-        return []
     sd = ctx.current
+    owner = "4862" in _owner_codes(ctx)
+    measured = any(any(x.code.upper() == "4862" for x in rd.faults) for _, rd in _dde_reads(sd))
+    if not owner and not measured:
+        return []
     sup, con, _cond, has_dtc, has_signal = air_path_evidence(sd, ctx.history, ctx.owner_reported)
     f = Finding(
         id="dde_4862",
@@ -508,7 +559,9 @@ def dde_4862(ctx: AnalysisContext) -> list[Finding]:
         supporting=sup,
         contradicting=con,
         conditions=[
-            "Owner-reported BMW fault 4862 (not read by this tool; whether it is stored now is unknown)."
+            "Owner-reported BMW fault 4862 (history, not read by this tool; kept separate from any measured read)."
+            if owner
+            else "Not owner-reported; listed by a BMW DDE fault-memory read in this session."
         ],
         caveats=[
             "A plausibility fault names a mismatch between signals. On its own it does not identify the EGR valve, the MAF sensor, a leak or the exhaust pressure path as the cause.",
@@ -526,4 +579,10 @@ def dde_4862(ctx: AnalysisContext) -> list[Finding]:
             ],
         ],
     )
+    if _apply_measured_dde(f, sd, "4862"):
+        f.strength = "suggestive"
+    elif not _dde_reads(sd):
+        f.conditions.append(
+            "No BMW DDE fault-memory read in this session: whether 4862 is stored now is unknown."
+        )
     return [f]

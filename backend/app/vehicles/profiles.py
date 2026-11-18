@@ -75,6 +75,11 @@ class VehicleProfile:
         "Not hardware-validated: tested against the synthetic ELM327 simulator only, not yet on this vehicle."
     )
 
+    @property
+    def supports_dde(self) -> bool:
+        """BMW DDE manufacturer path (gated, off by default) applies to this profile."""
+        return any(e.startswith("bmw-dde") for e in self.ecu_ids)
+
     def recording_profile(self, profile_id: str) -> RecordingProfile:
         for p in self.recording_profiles:
             if p.id == profile_id:

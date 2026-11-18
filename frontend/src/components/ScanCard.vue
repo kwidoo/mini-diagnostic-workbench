@@ -38,8 +38,29 @@ const when = (t: number) => new Date(t * 1000).toLocaleString()
         {{ scan.freeze_frame.status === 'none_stored' ? 'No freeze frame stored.' : `Not supported / not read (${scan.freeze_frame.status}).` }}
       </p>
     </div>
+    <div v-if="scan.manufacturer" class="mt-3 border-t border-line pt-2" data-test="dde-faults">
+      <div class="label">
+        BMW DDE fault memory (measured, separate from generic codes)
+        <span v-if="scan.manufacturer.synthetic" class="badge text-warn">SYNTHETIC</span>
+      </div>
+      <p class="text-sm" data-test="dde-fault-status">
+        <span class="badge">{{ scan.manufacturer.status.replaceAll('_', ' ') }}</span>
+        <span v-if="scan.manufacturer.status === 'no_faults'"> Complete read: no fault listed.</span>
+        <span v-else-if="scan.manufacturer.detail" class="text-ink-2"> {{ scan.manufacturer.detail }}</span>
+      </p>
+      <ul v-if="scan.manufacturer.faults.length" class="text-sm">
+        <li v-for="f in scan.manufacturer.faults" :key="f.raw_hex" data-test="dde-fault">
+          <b>{{ f.code }}</b>
+          <span class="text-ink-2">
+            manufacturer code as returned · raw {{ f.raw_hex }} · status byte {{ f.status_raw ?? '-' }}
+            <template v-if="f.status"> ({{ Object.entries(f.status).filter(([, v]) => v).map(([k]) => k).join(', ') || 'no status bit set' }})</template>
+            · ECU {{ scan.manufacturer.ecu ?? 'unknown' }}
+          </span>
+        </li>
+      </ul>
+    </div>
     <p class="mt-2 text-xs text-ink-2">
-      Generic OBD codes only. Manufacturer-specific fault memory is not readable with this tool. Nothing was cleared.
+      Generic OBD codes above. {{ scan.manufacturer ? 'BMW DDE fault memory is listed separately.' : 'Manufacturer-specific fault memory was not part of this scan.' }} Nothing was cleared.
     </p>
   </div>
 </template>

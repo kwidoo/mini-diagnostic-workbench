@@ -49,7 +49,11 @@ const inv = computed(() => wb.inventory)
         <thead><tr class="label"><th>PID</th><th>ECU</th><th>Signal</th><th>Value</th><th>Raw</th></tr></thead>
         <tbody>
           <tr v-for="(r, i) in inv.readings" :key="i">
-            <td class="font-mono">{{ r.pid.toString(16).toUpperCase().padStart(2, '0') }}</td><td>{{ r.ecu ?? '-' }}</td><td>{{ r.name }}</td>
+            <td class="font-mono">
+              <span v-if="r.source === 'bmw_dde'" class="badge" data-test="dde-reading">BMW DDE · {{ r.signal_key }}</span>
+              <template v-else>{{ r.pid.toString(16).toUpperCase().padStart(2, '0') }}</template>
+            </td>
+            <td>{{ r.ecu ?? '-' }}</td><td>{{ r.name }}</td>
             <td>
               <template v-if="r.text">{{ r.text }}</template>
               <template v-else-if="r.quality === 'ok' && r.value !== null">{{ r.value }} {{ r.unit }}</template>
