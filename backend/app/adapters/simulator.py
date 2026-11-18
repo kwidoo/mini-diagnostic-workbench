@@ -154,6 +154,12 @@ class DriveCycle:
     warm_tau_s: float = 240.0
     low_voltage: tuple[tuple[float, float, float], ...] = ()  # (t_from, t_to, volts) while running
     step_drops: tuple[tuple[float, float], ...] = ()  # (t, drop V for 2 s)
+    maf_dropouts: tuple[
+        tuple[float, float, float], ...
+    ] = ()  # (t_from, t_to, reported MAF g/s) while running
+    egr_err_swings: tuple[
+        tuple[float, float, float], ...
+    ] = ()  # (t_from, t_to, +/- amplitude %) while running
 
     def phase_at(self, t: float) -> tuple[str, float, float]:
         """-> (phase, seconds into phase, engine-running seconds so far)."""
@@ -238,11 +244,20 @@ class DriveCycle:
             egr = max(0.0, 1.0 + n(0, 0.5))
         cool = self._coolant(t)
         volts = self._system_volts(t, running, rng)
-        return {
+        out = {
             0x04: load, 0x05: cool, 0x0B: mapv, 0x0C: max(0.0, rpm), 0x0D: speed, 0x0F: self.ambient_c + 8 + n(0, 0.3),
             0x10: max(0.0, maf), 0x1F: 0.0 if not running else min(65535.0, into), 0x23: 30000 + rpm * 8 if running else 0,
             0x2C: egr, 0x2D: n(0, 1.5) if running else 0.0, 0x33: 101, 0x42: volts, 0x46: self.ambient_c, 0x49: 0,
         }  # fmt: skip
+        # applied after the common values so that cycles without them draw exactly the same random sequence
+        if running:
+            for a, b, value in self.maf_dropouts:
+                if a <= t < b:
+                    out[0x10] = value  # what the ECU reports; air keeps flowing (MAP / RPM unchanged)
+            for a, b, amp in self.egr_err_swings:
+                if a <= t < b:
+                    out[0x2D] = amp * math.sin(2 * math.pi * (t - a) / 6.0) + n(0, 2.0)
+        return out
 
 
 def _drive(cycle: DriveCycle, **kw) -> dict:
@@ -272,6 +287,26 @@ VOLTAGE_DROP = DriveCycle(
     (("ign", 8), ("idle", 40), ("city", 400), ("idle", 30), ("ign", 30), ("off", 300)),
     low_voltage=((150.0, 230.0, 11.9),),
     step_drops=((300.0, 1.6),),
+)
+# Anonymised stand-in for the first real MINI recording (2026-11-18): cold start (~7 degC -> ~73 degC),
+# stored generic P115D with MIL on, MAF reported as 0.00 / < 1 g/s for short spells with the engine running,
+# EGR-error swings both ways, and ECU communication lost at the end WITHOUT a measured engine stop.
+# The times and values are invented; only the observable pattern is reproduced.
+AIR_PATH = DriveCycle(
+    (("ign", 6), ("idle", 80), ("city", 300), ("idle", 45), ("off", 60)),
+    ambient_c=4.0,
+    coolant_start_c=7.0,
+    warm_tau_s=250.0,
+    maf_dropouts=(
+        (40.0, 40.6, 0.0),  # cold idle: single transient
+        (70.0, 71.6, 0.0),  # cold idle
+        (150.0, 150.6, 0.4),  # driving: low, not zero
+        (230.0, 232.0, 0.0),  # driving: repeated cluster ...
+        (250.0, 251.0, 0.0),
+        (265.0, 265.6, 0.6),
+        (400.0, 404.0, 0.0),  # warm idle: persistent
+    ),
+    egr_err_swings=((220.0, 280.0, 32.0), (330.0, 360.0, 28.0)),
 )
 IGNITION_OFF = DriveCycle((("ign", 5), ("idle", 60), ("ign", 20), ("off", 1200)), coolant_start_c=80.0)
 ECU_SILENT = DriveCycle((("ign", 5), ("idle", 60), ("off", 1200)), coolant_start_c=80.0)
@@ -320,6 +355,11 @@ SCENARIOS: dict[str, Scenario] = {
         ),
         Scenario("mini_voltage_drop", "Synthetic drive with low running voltage and a sudden drop", MINI,
                  **_drive(VOLTAGE_DROP)),
+        Scenario(
+            "mini_air_path_anomalies",
+            "Synthetic cold drive: MAF 0 / < 1 g/s spells while running, EGR-error swings, stored P115D, MIL on, "
+            "ECU lost at the end", MINI, stored=("P115D",), mil=True, **_drive(AIR_PATH),
+        ),
         Scenario("mini_ignition_off", "Synthetic idle, engine stop, then the ECU stops answering", MINI,
                  **_drive(IGNITION_OFF)),
         Scenario("mini_ecu_silent_running", "Synthetic: the ECU stops answering while the engine was running",

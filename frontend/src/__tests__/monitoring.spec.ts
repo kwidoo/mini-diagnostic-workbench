@@ -5,7 +5,7 @@ import MonitoringHistory from '../components/monitoring/MonitoringHistory.vue'
 import MonitoringLive from '../components/monitoring/MonitoringLive.vue'
 import MonitoringSession from '../components/monitoring/MonitoringSession.vue'
 import { ADAPTER_VOLTAGE_KEY, STALE_AFTER_MS, useWorkbench } from '../stores/workbench'
-import type { MonitorState, MonitoringSummary, Status } from '../types'
+import type { AirPath, MonitorState, MonitoringSummary, Status } from '../types'
 import LiveView from '../views/LiveView.vue'
 import MonitoringView from '../views/MonitoringView.vue'
 import { baseRoutes, connected, miniProfile, mockFetch, porscheProfile } from './helpers'
@@ -262,5 +262,121 @@ describe('MINI monitoring: session details and history', () => {
     await w.get('[data-test=history-filter]').setValue('highway')
     expect(w.find('[data-test=history-a]').exists()).toBe(false)
     expect(w.find('[data-test=history-c]').exists()).toBe(true)
+  })
+})
+
+const held = (value: number, age_s = 0.2, fresh = true) => ({ value, age_s, fresh })
+const airPath: AirPath = {
+  status: 'evaluated',
+  signals: {
+    maf: { name: 'MAF air flow rate (10)', hex: '10', status: 'measured', samples: 900, failed_reads: 11, reason: null },
+    egr_error: { name: 'EGR error (2D)', hex: '2D', status: 'measured', samples: 200, failed_reads: 0, reason: null },
+  },
+  running_s: 430,
+  maf: {
+    samples_ok: 900, failed_reads: { n: 11, by_quality: { no_data: 11 } },
+    running_state: { running_confirmed: 880, engine_not_running: 9, unknown: 11, note: '' },
+    zero_running: 18, low_running: 21, zero_per_1k_running: 20.45, low_per_1k_running: 23.86, zero_engine_not_running: 9, low_running_state_unknown: 1,
+    episodes: [{
+      type: 'maf_zero_while_running', origin: 'inferred', status: 'candidate', confidence: 'moderate', text: 'MAF 0.00 g/s ...',
+      t_start_rel_s: 69, t_end_rel_s: 70, duration_s: 1, samples: 3, zero_samples: 3, min_maf_gs: 0, pattern: 'persistent', repeated: true, cluster: 0,
+      motion: 'idle', temperature_state: 'cold', ecu: '7E8', context: { map: held(101), egr_error: held(30, 9, false) },
+      rpm: { unstable: false, window: { n: 20, min: 790, max: 820, std: 8 } },
+      evidence: [{ t_rel_s: 69, value_gs: 0, raw_hex: '0000', response: '41 10 00 00', ecu: '7E8' }], limitations: [],
+    }],
+    episode_count: 1, episode_total_s: 1, persistent_episodes: 1, transient_episodes: 0, repeated_clusters: 1, dips: [],
+    by_temperature: { cold: { running_samples: 500, zero: 18, low: 21, episodes: 1, low_per_1k: 42, zero_per_1k: 36 },
+      warm: { running_samples: 380, zero: 0, low: 0, episodes: 0, low_per_1k: 0, zero_per_1k: 0 }, unknown: { running_samples: 0, zero: 0, low: 0, episodes: 0, low_per_1k: null, zero_per_1k: null } },
+  },
+  egr_error: { samples: 200, count: 2, per_running_h: 16.7, max_abs_pct: 35, screen_pct: 15, excursions: [] },
+  correlations: { supporting: ['1 of 1 MAF episode(s) had an EGR-error excursion'], contradicting: ['MAP stayed within +/-5 kPa during 1 MAF episode(s).'],
+    note: 'associations in time, not causal relationships', symptom_markers: [] },
+  dtcs: {
+    scans: [{ phase: 'pre', t_rel_s: 0, mil_on: true }], codes: ['P115D'],
+    by_code: [{ code: 'P115D', family: 'manufacturer_defined', air_path_relevance: 'unknown', description: null, description_status: 'not_verified',
+      note: 'manufacturer-defined code range', ecus: ['7E8'], statuses: ['stored'], scan_phases: ['pre'], timing: 'present in the pre-scan; when it was set is unknown' }],
+    mil_on: true, owner_reported_manufacturer_codes: [{ code: '4862', system: 'BMW DDE', source: 'owner report' }], owner_reported_note: 'not read by this tool', notes: [],
+  },
+  limitations: ['Signals are polled one after another.'],
+  heuristics: { maf_low_gs: 1, airpath_running_rpm: 600, egr_error_screen_pct: 15 },
+  history: { other_sessions: 0, medians: null, note: 'Needs at least 2 other sessions' },
+}
+
+describe('MINI monitoring: air path', () => {
+  const sessions = [{ id: 'm1', kind: 'record', vehicle_profile: miniProfile.id, source: 'simulator', synthetic: true, label: 'run', started_at: 1, ended_at: 2, monitoring: true }]
+  const series = { session_id: 'm1', signals: [
+    { pid: 16, hex: '10', name: 'MAF', unit: 'g/s', decoded: true, provenance: 'ecu', points: [[0, 9.5], [69, 0], [71, 9.4]], failed: [] },
+  ], annotations: [] }
+
+  it('shows MAF candidates with raw evidence, stale context, P115D without a guessed meaning, and owner codes apart', async () => {
+    const { w, wb } = await mountWith(MonitoringSession, connected, {
+      'GET /api/sessions': sessions, 'GET /api/sessions/m1/monitoring': { ...summary, air_path: airPath }, 'GET /api/sessions/m1/samples': series,
+    })
+    await wb.loadSessions()
+    await flushPromises()
+    const panel = w.get('[data-test=air-path-panel]')
+    expect(panel.get('[data-test=air-path-maf-counts]').text()).toContain('18 at 0.00 g/s')
+    const ep = panel.get('[data-test=maf-episode]').text()
+    expect(ep).toContain('41 10 00 00')
+    expect(ep).toContain('inferred · candidate')
+    expect(ep).toContain('EGR error stale (9 s old)')
+    expect(panel.get('[data-test=dtc-P115D]').text()).toContain('description not verified')
+    expect(panel.get('[data-test=owner-codes]').text()).toContain('not read by this tool')
+    expect(panel.get('[data-test=air-path-correlations]').text()).toContain('MAP stayed')
+    expect(w.findAll('[data-test=band]').some((b) => b.text().includes('MAF 0 (candidate)'))).toBe(true)
+  })
+
+  it('shows unavailable MAF as not available, never as zero, and tolerates older servers without air_path', async () => {
+    const unavailable: AirPath = {
+      ...airPath, status: 'maf_not_available',
+      signals: { maf: { ...airPath.signals.maf, status: 'not_available', samples: 0 }, egr_error: { ...airPath.signals.egr_error, status: 'not_available', samples: 0 } },
+      maf: { samples_ok: 0, failed_reads: { n: 0, by_quality: {} }, episodes: [], dips: [] },
+      egr_error: { samples: 0, count: null, per_running_h: null, excursions: [] },
+    }
+    const { w, wb } = await mountWith(MonitoringSession, connected, {
+      'GET /api/sessions': sessions, 'GET /api/sessions/m1/monitoring': { ...summary, air_path: unavailable }, 'GET /api/sessions/m1/samples': series,
+    })
+    await wb.loadSessions()
+    await flushPromises()
+    expect(w.get('[data-test=air-path-maf-unavailable]').text()).toContain('not zero')
+    expect(w.get('[data-test=air-path-egr]').text()).toContain('not available')
+    expect(w.find('[data-test=air-path-maf-counts]').exists()).toBe(false)
+
+    const old = await mountWith(MonitoringSession, connected, {
+      'GET /api/sessions': sessions, 'GET /api/sessions/m1/monitoring': summary, 'GET /api/sessions/m1/samples': series,
+    })
+    await old.wb.loadSessions()
+    await flushPromises()
+    expect(old.w.find('[data-test=air-path-panel]').exists()).toBe(false)
+    expect(old.w.find('[data-test=dpf-panel]').exists()).toBe(true)
+  })
+
+  it('compares drives with normalised air-path rates and a per-origin trend', async () => {
+    const base = {
+      started_at: 1, synthetic: false, baseline_origin: 'real', aborted: null, drive_type: 'city', running_min: 12, max_speed_kmh: 50, engine_stops: 0,
+      fan_runs_after_shutdown: 0, fan_durations_s: [], battery_warnings: 0, possible_regenerations: 0, possible_interrupted_regenerations: 0,
+      user_suspected_regenerations: 0, coolant_max_c: 73, ecu_voltage_running_median: 14.1, adapter_voltage_running_median: 13.9, link_events: 1,
+    }
+    const ap = { maf_status: 'measured', maf_low_per_1k: 23.86, maf_zero_per_1k: 20.45, maf_episodes: 7, maf_episodes_per_h: 58.6, egr_excursions_per_h: 16.7,
+      dtcs: ['P115D'], mil_on: true }
+    const trend = {
+      cohort: { vehicle_profile: miniProfile.id, origin: 'real', vehicle_identity: null }, sessions: 2, sessions_with_maf: 1, sessions_scanned: 2, series: [],
+      medians: { maf_low_per_1k: 23.86, maf_zero_per_1k: 20.45, maf_episodes_per_h: 58.6, egr_excursions_per_h: 16.7 },
+      by_drive_type: { city: { sessions: 1, maf_low_per_1k: 23.86, maf_zero_per_1k: 20.45, maf_episodes_per_h: 58.6, egr_excursions_per_h: 16.7 } },
+      cold: null, warm: null, idle: null, moving: null, dtc_recurrence: [{ code: 'P115D', sessions: 2, share_of_scanned_sessions: 1, first_seen: 1, last_seen: 2 }],
+      mil_on_sessions: 2, note: 'Rates are normalised',
+    }
+    const hist = { sessions: [
+      { ...base, id: 'a', label: 'a', air_path: ap },
+      { ...base, id: 'b', label: 'b', air_path: { ...ap, maf_status: 'not_available', maf_low_per_1k: null, maf_zero_per_1k: null, maf_episodes: null, maf_episodes_per_h: null } },
+      { ...base, id: 'old', label: 'old' },
+    ], air_path_trends: [trend] }
+    const { w } = await mountWith(MonitoringHistory, connected, { 'GET /api/monitoring/history': hist })
+    expect(w.get('[data-test=airpath-maf-a]').text()).toBe('23.86 / 20.45')
+    expect(w.get('[data-test=airpath-maf-b]').text()).toBe('n/a / n/a')
+    expect(w.get('[data-test=airpath-maf-old]').text()).toBe('n/a')
+    expect(w.get('[data-test=history-a]').text()).toContain('P115D · MIL on')
+    expect(w.get('[data-test=airpath-dtc-recurrence-real]').text()).toContain('P115D in 2 (100 %)')
+    expect(w.findAll('[data-test^=history-]').filter((x) => x.element.tagName === 'TR').length).toBe(3)
   })
 })

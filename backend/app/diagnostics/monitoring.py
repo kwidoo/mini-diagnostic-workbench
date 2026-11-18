@@ -64,6 +64,39 @@ CRANK_WINDOW_S = 15.0
 EVENT_VOLTAGE_WINDOW_S = 60.0
 LOW_CONFIDENCE, MODERATE_CONFIDENCE = "low", "moderate"
 
+# -- air path (MAF / EGR / MAP) screening heuristics: see app/diagnostics/air_path.py ------------
+# None of these is a BMW / MINI specification. They only decide what is listed for a closer look.
+AIRPATH_RUNNING_RPM = (
+    600.0  # measured RPM on BOTH sides of a MAF sample at or above this: "confirmed running"
+)
+AIRPATH_RPM_MAX_AGE_S = 3.0  # ... and each of those RPM samples at most this far from the MAF sample
+MAF_ZERO_GS = 0.0  # zero-MAF: exactly this value as decoded from the ECU answer
+MAF_LOW_GS = 1.0  # low-MAF screening value (g/s): below this while running is listed
+AIRPATH_CONTEXT_MAX_AGE_S = 5.0  # MAP / load / speed / EGR values older than this are stale (not associated)
+AIRPATH_COOLANT_MAX_AGE_S = 30.0  # coolant changes slowly: older than this is stale
+AIRPATH_EPISODE_GAP_S = 5.0  # low-MAF samples closer than this (no normal MAF between) form one episode
+AIRPATH_PERSISTENT_S = 3.0  # an episode lasting this long, or with >= 3 samples, is "persistent"
+AIRPATH_REPEAT_WINDOW_S = 120.0  # episodes starting within this of the previous one are a repeated cluster
+AIRPATH_DIP_FRACTION = 0.5  # abrupt dip: MAF falls to <= this share of the previous running sample ...
+AIRPATH_DIP_MIN_GS = 2.0  # ... by at least this many g/s ...
+AIRPATH_DIP_RECOVERY_S = 3.0  # ... and is back to >= AIRPATH_DIP_RECOVERED_FRACTION within this time ...
+AIRPATH_DIP_RECOVERED_FRACTION = 0.8
+AIRPATH_DIP_RPM_STEADY = 0.10  # ... while RPM changed by at most 10 % (excludes most gear changes / lift-off)
+AIRPATH_WARM_COOLANT_C = 60.0  # fixed cold / warm split so that drives stay comparable over months
+AIRPATH_ASSOC_WINDOW_S = 5.0  # +/- around an episode for EGR / MAP / RPM associations
+AIRPATH_BASELINE_WINDOW_S = 15.0  # MAP / commanded EGR before an episode, to measure a change against
+AIRPATH_MAP_CHANGE_KPA = 5.0
+AIRPATH_EGR_CMD_CHANGE_PCT = 10.0
+AIRPATH_RPM_UNSTABLE_STD = 30.0  # rpm std within the window, and ...
+AIRPATH_RPM_UNSTABLE_FACTOR = 2.0  # ... at least this many times the session's usual idle-window std
+AIRPATH_ANNOTATION_WINDOW_S = 30.0  # a symptom marker this close to an air-path anomaly is "near" it
+EGR_ERROR_SCREEN_PCT = (
+    15.0  # |EGR error| (PID 2D) at or above this is an excursion (also used by air_path_egr_maf)
+)
+AIRPATH_EGR_EXCURSION_GAP_S = 10.0  # excursion samples closer than this belong to one excursion
+AIRPATH_MIN_RUNNING_MAF_SAMPLES = 50  # fewer confirmed-running MAF samples: no rates are computed
+AIRPATH_MIN_HISTORY_SESSIONS = 2  # other sessions of the same cohort needed before comparing against them
+
 #: published with every summary so a reader sees exactly which screening values were used
 HEURISTICS: dict[str, float] = {
     "running_rpm": RUNNING_RPM,
@@ -90,6 +123,32 @@ HEURISTICS: dict[str, float] = {
     "volt_no_rise_v": VOLT_NO_RISE_V,
     "crank_window_s": CRANK_WINDOW_S,
     "event_voltage_window_s": EVENT_VOLTAGE_WINDOW_S,
+    "airpath_running_rpm": AIRPATH_RUNNING_RPM,
+    "airpath_rpm_max_age_s": AIRPATH_RPM_MAX_AGE_S,
+    "maf_zero_gs": MAF_ZERO_GS,
+    "maf_low_gs": MAF_LOW_GS,
+    "airpath_context_max_age_s": AIRPATH_CONTEXT_MAX_AGE_S,
+    "airpath_coolant_max_age_s": AIRPATH_COOLANT_MAX_AGE_S,
+    "airpath_episode_gap_s": AIRPATH_EPISODE_GAP_S,
+    "airpath_persistent_s": AIRPATH_PERSISTENT_S,
+    "airpath_repeat_window_s": AIRPATH_REPEAT_WINDOW_S,
+    "airpath_dip_fraction": AIRPATH_DIP_FRACTION,
+    "airpath_dip_min_gs": AIRPATH_DIP_MIN_GS,
+    "airpath_dip_recovery_s": AIRPATH_DIP_RECOVERY_S,
+    "airpath_dip_recovered_fraction": AIRPATH_DIP_RECOVERED_FRACTION,
+    "airpath_dip_rpm_steady": AIRPATH_DIP_RPM_STEADY,
+    "airpath_warm_coolant_c": AIRPATH_WARM_COOLANT_C,
+    "airpath_assoc_window_s": AIRPATH_ASSOC_WINDOW_S,
+    "airpath_baseline_window_s": AIRPATH_BASELINE_WINDOW_S,
+    "airpath_map_change_kpa": AIRPATH_MAP_CHANGE_KPA,
+    "airpath_egr_cmd_change_pct": AIRPATH_EGR_CMD_CHANGE_PCT,
+    "airpath_rpm_unstable_std": AIRPATH_RPM_UNSTABLE_STD,
+    "airpath_rpm_unstable_factor": AIRPATH_RPM_UNSTABLE_FACTOR,
+    "airpath_annotation_window_s": AIRPATH_ANNOTATION_WINDOW_S,
+    "egr_error_screen_pct": EGR_ERROR_SCREEN_PCT,
+    "airpath_egr_excursion_gap_s": AIRPATH_EGR_EXCURSION_GAP_S,
+    "airpath_min_running_maf_samples": AIRPATH_MIN_RUNNING_MAF_SAMPLES,
+    "airpath_min_history_sessions": AIRPATH_MIN_HISTORY_SESSIONS,
 }
 
 MANUFACTURER_DPF_KEYS = ("dpf_diff_pressure", "dpf_soot_load", "dpf_regen_status", "exhaust_backpressure")
@@ -1158,6 +1217,8 @@ def references(history: list[SessionData]) -> dict[str, Any]:
             "refusing to pool references across cohorts: "
             + ", ".join(sorted(f"{p}/{o}/{'confirmed' if i else 'unconfirmed'}" for p, o, i in cohorts))
         )
+    from app.diagnostics.air_path import air_path_row
+
     cohort = next(iter(cohorts)) if cohorts else None
     plateau = warm_plateau(history)
     return {
@@ -1165,6 +1226,8 @@ def references(history: list[SessionData]) -> dict[str, Any]:
         "baseline": regen_baseline(history, plateau.get("value")),
         "cohort": cohort_label(cohort) if cohort else None,
         "_cohort": cohort,
+        # compact air-path statistics of every session of this cohort (for cross-session comparison)
+        "air_path_rows": [air_path_row(h) for h in sorted(history, key=lambda h: h.session["started_at"])],
     }
 
 
@@ -1185,13 +1248,19 @@ def _public_refs(refs: dict[str, Any]) -> dict[str, Any]:
 
 
 def monitoring_summary(
-    sd: SessionData, history: list[SessionData] | None = None, refs: dict[str, Any] | None = None
+    sd: SessionData,
+    history: list[SessionData] | None = None,
+    refs: dict[str, Any] | None = None,
+    owner_reported: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Everything the monitoring dashboard / report / export needs, recomputable offline.
 
     ``history``: the vehicle's sessions; only monitoring sessions (plus this one) feed the
-    references. ``refs`` (from :func:`references`) skips recomputing them.
+    references. ``refs`` (from :func:`references`) skips recomputing them. ``owner_reported``:
+    the vehicle record's owner-reported codes (default: the profile's).
     """
+    from app.diagnostics.air_path import air_path_summary, compare_to_cohort
+
     if refs is None:
         refs = references(reference_pool(sd, history))
     elif refs.get("_cohort") is not None and refs["_cohort"] != baseline_cohort(sd.session):
@@ -1228,7 +1297,9 @@ def monitoring_summary(
         st["t_rel_s"] = clk.rel(st["t_wall"])
     for f in fans["runs"]:
         f["t_start_rel_s"], f["t_end_rel_s"] = clk.rel(f["t_start_wall"]), clk.rel(f["t_end_wall"])
-    detected = [*regens, *interrupted, *cool["detected"]]
+    air = air_path_summary(sd, owner_reported)
+    air["history"] = compare_to_cohort(sd.id, refs.get("air_path_rows") or [])
+    detected = [*regens, *interrupted, *cool["detected"], *air["detected_events"]]
     return {
         "session_id": sd.id,
         "is_monitoring_session": is_monitoring_session(sd.session),
@@ -1258,15 +1329,20 @@ def monitoring_summary(
         "signals": signal_availability(sd),
         "sampling": sampling_quality(sd),
         "observed_capabilities": (sd.session["meta"].get("monitoring") or {}).get("observed_capabilities"),
+        "air_path": air,
         "references": _public_refs(refs),
         "baseline_origin": baseline_origin(sd.session),
         "heuristics": HEURISTICS,
     }
 
 
-def history_row(sd: SessionData, refs: dict[str, Any]) -> dict[str, Any]:
+def history_row(
+    sd: SessionData, refs: dict[str, Any], owner_reported: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """One line of the historical comparison (several drives side by side)."""
-    m = monitoring_summary(sd, refs=refs)
+    from app.diagnostics.air_path import air_path_row
+
+    m = monitoring_summary(sd, refs=refs, owner_reported=owner_reported)
     s = sd.session
     after = [f for f in m["fan"]["runs"] if f["after_shutdown"]]
     ecu_run = (
@@ -1305,6 +1381,7 @@ def history_row(sd: SessionData, refs: dict[str, Any]) -> dict[str, Any]:
         "ecu_voltage_running_median": ecu_run.get("median"),
         "adapter_voltage_running_median": ad_run.get("median"),
         "link_events": len(m["link"]),
+        "air_path": {**air_path_row(sd, m["air_path"]), "vs_cohort": m["air_path"]["history"]},
     }
 
 
@@ -1320,17 +1397,25 @@ def summary_for(store: Any, sid: str) -> dict[str, Any]:
         for s in store.list_sessions(current.session["vehicle_profile"])
         if s["id"] == sid or (is_monitoring_session(s) and baseline_cohort(s) == key)
     ]
-    return monitoring_summary(current, history)
+    return monitoring_summary(current, history, owner_reported=_owner_reported(store, key[0]))
+
+
+def _owner_reported(store: Any, vehicle_profile: str) -> dict[str, Any] | None:
+    """The stored vehicle record's owner-reported data, or None (then the profile's default is used)."""
+    record = store.get_setting(f"vehicle:{vehicle_profile}", None)
+    return (record or {}).get("owner_reported")
 
 
 def history_for(store: Any, vehicle_profile: str) -> dict[str, Any]:
     """Historical comparison of a vehicle profile's monitoring sessions. Each row is judged with
     the references of its own cohort; real and synthetic rows never share a baseline."""
+    from app.diagnostics.air_path import trends
     from app.diagnostics.engine import load_session
 
     sessions = [
         load_session(store, s["id"]) for s in store.list_sessions(vehicle_profile) if is_monitoring_session(s)
     ]
+    owner = _owner_reported(store, vehicle_profile)
     by_cohort = references_by_cohort(sessions)
     cohorts = [
         {**_public_refs(r), "sessions": sum(1 for sd in sessions if baseline_cohort(sd.session) == k)}
@@ -1343,5 +1428,12 @@ def history_for(store: Any, vehicle_profile: str) -> dict[str, Any]:
         "vehicle_profile": vehicle_profile,
         "references": head,
         "references_by_cohort": cohorts,
-        "sessions": [history_row(sd, by_cohort[baseline_cohort(sd.session)]) for sd in reversed(sessions)],
+        "sessions": [
+            history_row(sd, by_cohort[baseline_cohort(sd.session)], owner) for sd in reversed(sessions)
+        ],
+        # multi-session air-path statistics, one block per cohort (real first; never pooled across cohorts)
+        "air_path_trends": [
+            trends(r["air_path_rows"], r["cohort"])
+            for _, r in sorted(by_cohort.items(), key=lambda kv: (kv[0][1] != "real", kv[0][2] or ""))
+        ],
     }

@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.diagnostics.air_path import air_path_summary, dtc_summary, has_timeline
+from app.diagnostics.dtc_info import AIR_PATH_CODES, DPF_CODES
 from app.diagnostics.engine import WINDOW_S, AnalysisContext, SessionData, windows
+from app.diagnostics.monitoring import (
+    AIRPATH_MIN_HISTORY_SESSIONS,
+    AIRPATH_RUNNING_RPM,
+    EGR_ERROR_SCREEN_PCT,
+    MAF_LOW_GS,
+    baseline_cohort,
+    baseline_origin,
+)
 from app.models.domain import Evidence, Finding
 
 RPM, MAP, MAF, BARO, EGR_CMD, EGR_ERR = 0x0C, 0x0B, 0x10, 0x33, 0x2C, 0x2D
@@ -17,32 +27,12 @@ EXTENDED_AIR_PIDS = {
     0x87: "Intake manifold absolute pressure (extended)",
 }
 
-# SAE J2012 generic code families used only to say "a generic code in this family is present".
-AIR_PATH_CODES = (
-    {f"P010{i}" for i in range(10)}
-    | {f"P040{i}" for i in range(10)}
-    | {"P0234", "P0235", "P0236", "P0237", "P0238", "P0299", "P2413"}
-)
-DPF_CODES = {
-    "P2002",
-    "P2003",
-    "P242F",
-    "P244A",
-    "P244B",
-    "P2452",
-    "P2453",
-    "P2454",
-    "P2455",
-    "P2456",
-    "P2458",
-    "P2459",
-    "P2463",
-    "P246C",
-}
+# AIR_PATH_CODES / DPF_CODES (SAE J2012 families) live in app.diagnostics.dtc_info and stay importable here.
+__all__ = ["AIR_PATH_CODES", "DPF_CODES", "air_path_egr_maf", "dde_4862", "dpf_480a"]
 
 # Screening heuristics of this tool, NOT vehicle-specific pass/fail limits (none are published
 # for this ECU through generic OBD):
-EGR_ERR_SCREEN = 15.0  # % |EGR error| (PID 2D) worth a closer look
+EGR_ERR_SCREEN = EGR_ERROR_SCREEN_PCT  # % |EGR error| (PID 2D) worth a closer look (monitoring.HEURISTICS)
 EGR_MIN_SAMPLES = 20  # fewer good samples: no statement about the EGR error at all
 EGR_MIN_SPAN_S = 10.0  # shorter recording: no statement
 EGR_MIN_WINDOW_SAMPLES = 3  # a window/event needs at least this many samples to be evaluated
@@ -178,8 +168,16 @@ def egr_error_evidence(sd: SessionData) -> tuple[Evidence | None, bool, list[str
     return ev, sustained or intermittent or bool(flagged_events), st["limitations"]
 
 
-def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], list[str], bool, bool]:
-    """-> (supporting, contradicting, conditions, has_dtc, has_signal_evidence)."""
+def air_path_evidence(
+    sd: SessionData,
+    history: list[SessionData] | None = None,
+    owner_reported: dict[str, Any] | None = None,
+) -> tuple[list[Evidence], list[Evidence], list[str], bool, bool]:
+    """-> (supporting, contradicting, conditions, has_dtc, has_signal_evidence).
+
+    ``history``: other sessions of the vehicle (only those of the same cohort are used for the
+    cross-session lines). ``owner_reported``: the vehicle record (BMW codes stay apart from generic ones).
+    """
     sup: list[Evidence] = []
     con: list[Evidence] = []
     cond = [
@@ -198,6 +196,8 @@ def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], 
                 f"{name} (PID {pid:02X}): advertised by the ECU; raw bytes only, no verified decoder in this tool."
             )
 
+    ap = air_path_summary(sd, owner_reported) if has_timeline(sd) else None
+    dt = ap["dtcs"] if ap else dtc_summary(sd, owner_reported=owner_reported)
     codes = sorted(sd.dtc_codes() & AIR_PATH_CODES)
     if codes:
         sup.append(
@@ -206,11 +206,35 @@ def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], 
                 values={"dtcs": codes},
             )
         )
-    elif sd.scans:
+    for b in dt["by_code"]:
+        if b["air_path_relevance"] != "unknown":
+            continue
+        rows = [d for d in dt["detected"] if d["code"] == b["code"]]
+        where = "; ".join(
+            f"ECU {d['ecu'] or '?'}, {d['status']}, {d['scan_phase']} scan (raw {d['raw_hex']})" for d in rows
+        )
+        cond.append(
+            f"Generic OBD DTC {b['code']} read by this tool ({where}): {b['note']} Timing: {b['timing']}."
+        )
+    if dt["mil_on"]:
+        cond.append("MIL reported ON in this session's fault scan(s).")
+    if not codes and sd.scans and not dt["unverified_manufacturer_codes"]:
         con.append(
             Evidence(
                 text="No generic DTC in the air-mass / manifold-pressure / EGR / boost families in this session's scans."
             )
+        )
+    elif not codes and dt["unverified_manufacturer_codes"]:
+        cond.append(
+            "No DTC from the SAE air-path families, but "
+            + ", ".join(dt["unverified_manufacturer_codes"])
+            + " (meaning unverified) is present, so this is NOT evidence that there is no air-path fault."
+        )
+    if dt["owner_reported_manufacturer_codes"]:
+        cond.append(
+            "Owner-reported BMW DDE fault(s) "
+            + ", ".join(c["code"] for c in dt["owner_reported_manufacturer_codes"])
+            + ": history from a BMW tester, not read by this tool; kept apart from the generic codes above."
         )
 
     signal = False
@@ -264,7 +288,109 @@ def air_path_evidence(sd: SessionData) -> tuple[list[Evidence], list[Evidence], 
         cond.append(
             "Boost gauge pressure not derived: barometric pressure was not recorded, and MAP alone is absolute pressure."
         )
+    if ap is not None:
+        signal = _maf_evidence(sd, ap, history, sup, con, cond) or signal
     return sup, con, cond, bool(codes), signal
+
+
+def _maf_evidence(
+    sd: SessionData,
+    ap: dict[str, Any],
+    history: list[SessionData] | None,
+    sup: list[Evidence],
+    con: list[Evidence],
+    cond: list[str],
+) -> bool:
+    """MAF anomalies while running, their associations, and the cross-session picture. -> signal evidence?"""
+    maf = ap["maf"]
+    if ap["signals"]["maf"]["status"] != "measured":
+        cond.append(
+            f"MAF anomaly screening: MAF {ap['signals']['maf']['status'].replace('_', ' ')} (no statistics, not zero)."
+        )
+        return False
+    rs = maf["running_state"]
+    signal = False
+    eps = maf["episodes"]
+    values = {
+        k: maf[k]
+        for k in (
+            "zero_running", "low_running", "zero_per_1k_running", "low_per_1k_running", "episode_count",
+            "episode_total_s", "persistent_episodes", "repeated_clusters", "zero_engine_not_running",
+            "low_running_state_unknown",
+        )
+    }  # fmt: skip
+    values["running_confirmed_samples"] = rs["running_confirmed"]
+    values["failed_reads"] = maf["failed_reads"]
+    if eps:
+        signal = maf["zero_running"] > 0 or maf["persistent_episodes"] > 0 or maf["repeated_clusters"] > 0
+        sup.append(
+            Evidence(
+                text=f"MAF below {MAF_LOW_GS:g} g/s in {maf['low_running']} of {rs['running_confirmed']} samples taken while "
+                f"measured RPM was >= {AIRPATH_RUNNING_RPM:.0f} on both sides ({maf['zero_running']} exactly 0.00 g/s, "
+                f"present in the ECU's raw answer); {len(eps)} episode(s), {maf['persistent_episodes']} persistent, "
+                f"{maf['repeated_clusters']} repeated cluster(s). Screening values, not a sensor diagnosis.",
+                values={**values, "episodes": [
+                    {k: e[k] for k in ("t_start_rel_s", "duration_s", "samples", "min_maf_gs", "pattern", "repeated",
+                                       "motion", "temperature_state", "ecu")}
+                    for e in eps[:20]
+                ]},
+            )
+        )  # fmt: skip
+    elif rs["running_confirmed"] >= 20:
+        con.append(
+            Evidence(
+                text=f"No MAF value below {MAF_LOW_GS:g} g/s in {rs['running_confirmed']} samples taken with the engine "
+                "confirmed running.",
+                values=values,
+            )
+        )
+    if maf["dips"]:
+        sup.append(
+            Evidence(
+                text=f"{len(maf['dips'])} abrupt MAF dip(s) with recovery while RPM stayed steady (candidate; driver "
+                "inputs can also cause short drops).",
+                values={"dips": [{k: d[k] for k in ("t_start_rel_s", "from_gs", "min_gs", "recovered_gs", "recovery_s")}
+                                 for d in maf["dips"][:20]]},
+            )
+        )  # fmt: skip
+    if maf["zero_engine_not_running"]:
+        cond.append(
+            f"{maf['zero_engine_not_running']} MAF sample(s) at 0 g/s with the engine measured not running: expected, not counted."
+        )
+    corr = ap["correlations"]
+    if eps:
+        for line in corr["supporting"]:
+            cond.append("Association (not causation): " + line)
+        for line in corr["contradicting"]:
+            con.append(Evidence(text=line))
+    else:
+        for m in corr["symptom_markers"]:
+            if m["near_air_path_anomaly"]:
+                cond.append(
+                    f"Association (not causation): marker '{m['event']}' near an EGR-error excursion."
+                )
+    cohort = baseline_cohort(sd.session)
+    same = [h for h in history or [] if h.id != sd.id and baseline_cohort(h.session) == cohort]
+    if len(same) >= AIRPATH_MIN_HISTORY_SESSIONS:
+        from app.diagnostics.air_path import air_path_row
+
+        rows = [air_path_row(h) for h in same]
+        measured = [r for r in rows if r["maf_status"] == "measured"]
+        low = sum(1 for r in measured if (r["maf_low_running"] or 0) > 0)
+        scanned = [r for r in rows if r["dtc_scanned"]]
+        here = set(ap["dtcs"]["codes"])
+        recur = {c: sum(1 for r in scanned if c in (r["dtcs"] or [])) for c in sorted(here)}
+        cond.append(
+            f"Other {baseline_origin(sd.session)} sessions of this vehicle: MAF measured in {len(measured)}, low MAF while "
+            f"running in {low} of them"
+            + (
+                "; " + ", ".join(f"{c} present in {n} of {len(scanned)} scanned" for c, n in recur.items())
+                if recur and scanned
+                else ""
+            )
+            + "."
+        )
+    return signal
 
 
 AIR_PATH_STEPS = [
@@ -277,7 +403,7 @@ AIR_PATH_STEPS = [
 
 def air_path_egr_maf(ctx: AnalysisContext) -> list[Finding]:
     sd = ctx.current
-    sup, con, cond, has_dtc, has_signal = air_path_evidence(sd)
+    sup, con, cond, has_dtc, has_signal = air_path_evidence(sd, ctx.history, ctx.owner_reported)
     f = Finding(
         id="air_path_egr_maf",
         title="Air path: EGR / MAF plausibility (generic OBD)",
@@ -300,6 +426,10 @@ def air_path_egr_maf(ctx: AnalysisContext) -> list[Finding]:
             "No reference MAF value is asserted: the correct idle air mass depends on the engine variant and EGR state.",
             f"The {EGR_ERR_SCREEN:.0f} % EGR-error level is a screening heuristic of this tool, not a BMW pass/fail threshold.",
             "Signals are polled one after another, never at the same instant; values of different PIDs are not simultaneous.",
+            "MAF 0.00 g/s with the engine running is not a plausible air mass, but this tool cannot tell whether the "
+            "sensor, its wiring, the ECU's signal processing or the generic-OBD reporting produced it.",
+            "Manufacturer-range codes such as P115D are shown as raw codes: their meaning is not verified for this ECU variant.",
+            "Associations between MAF, EGR, MAP and RPM are temporal, not causal; no component is identified as faulty.",
         ],
         next_steps=list(AIR_PATH_STEPS),
     )
@@ -363,7 +493,7 @@ def dde_4862(ctx: AnalysisContext) -> list[Finding]:
     if "4862" not in _owner_codes(ctx):
         return []
     sd = ctx.current
-    sup, con, _cond, has_dtc, has_signal = air_path_evidence(sd)
+    sup, con, _cond, has_dtc, has_signal = air_path_evidence(sd, ctx.history, ctx.owner_reported)
     f = Finding(
         id="dde_4862",
         title="Owner-reported BMW DDE fault 4862",

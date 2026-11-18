@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../api'
 import type {
-  Annotation, Comparison, Finding, HistoryRow, Inventory, LiveSignal, MonitoringSummary, MonitorState, Plan, Profile, Reading,
+  AirPathTrend, Annotation, Comparison, Finding, HistoryRow, Inventory, LiveSignal, MonitoringSummary, MonitorState, Plan, Profile, Reading,
   Series, SessionDetail, SessionSummary, Status, VehicleRecord,
 } from '../types'
 
@@ -40,6 +40,8 @@ interface State {
   monitoring: MonitoringSummary | null
   monitoringSeries: Series | null
   history: HistoryRow[]
+  /** multi-session air-path statistics per cohort (real / synthetic never pooled) */
+  airPathTrends: AirPathTrend[]
 }
 
 let socket: WebSocket | null = null
@@ -49,7 +51,7 @@ export const useWorkbench = defineStore('workbench', {
     status: null, profiles: [], activeProfileId: '', vehicle: null, error: null, busy: null, sessions: [],
     lastScan: null, inventory: null, plan: null, live: {}, liveSessionId: null, liveMarkers: [], wsState: 'closed',
     current: null, currentSeries: null, findings: [], findingsFor: null, comparison: null, fixtures: [],
-    liveEvents: [], monitoring: null, monitoringSeries: null, history: [],
+    liveEvents: [], monitoring: null, monitoringSeries: null, history: [], airPathTrends: [],
   }),
   getters: {
     profile: (s): Profile | null => s.profiles.find((p) => p.id === s.activeProfileId) ?? null,
@@ -225,7 +227,9 @@ export const useWorkbench = defineStore('workbench', {
     async loadHistory() {
       await this.run('loading history', async () => {
         const q = this.activeProfileId ? `?vehicle=${encodeURIComponent(this.activeProfileId)}` : ''
-        this.history = (await api.get<{ sessions: HistoryRow[] }>(`/api/monitoring/history${q}`)).sessions
+        const h = await api.get<{ sessions: HistoryRow[]; air_path_trends?: AirPathTrend[] }>(`/api/monitoring/history${q}`)
+        this.history = h.sessions
+        this.airPathTrends = h.air_path_trends ?? []
       })
     },
     async setDriveType(id: string, driveType: string | null) {

@@ -128,7 +128,8 @@ export interface SignalStatus {
   ok: number; raw: number; failed: number; reason?: string | null
 }
 export interface DetectedEvent {
-  type: string; origin: 'inferred'; status: 'possible'; confidence: 'low' | 'moderate'; text: string
+  /** 'possible' for DPF / cooling interpretations, 'candidate' for air-path screening results */
+  type: string; origin: 'inferred'; status: 'possible' | 'candidate'; confidence: 'low' | 'moderate'; text: string
   t_start_rel_s?: number; t_end_rel_s?: number; t_rel_s?: number; indicators?: string[]; fan_runs_after_s?: (number | null)[]
 }
 export interface FanRun {
@@ -180,6 +181,74 @@ export interface MonitoringSummary {
     signals: (Metric & { mode?: number; tier: Tier | null; target_hz_base: number | null; target_hz_final: number | null })[]
   }
   observed_capabilities: Record<string, string | number> | null
+  /** absent in responses of older servers */
+  air_path?: AirPath
+}
+/** a measured value held from its own timestamp, with its age; stale values are not associated */
+export interface Held { value: number; age_s: number; fresh: boolean }
+export interface AirPathSignal { name: string; hex: string; status: DataStatus; samples: number; failed_reads: number; reason: string | null }
+export interface AirPathGroup { running_samples: number; zero: number; low: number; episodes: number; low_per_1k: number | null; zero_per_1k: number | null }
+export interface MafEpisode extends DetectedEvent {
+  t_start_rel_s: number; t_end_rel_s: number; duration_s: number; samples: number; zero_samples: number; min_maf_gs: number
+  pattern: 'persistent' | 'single_transient'; repeated: boolean; cluster: number; motion: string; temperature_state: string; ecu: string | null
+  context: Record<string, Held | null>; rpm: { unstable: boolean | null; window: { n: number; min: number; max: number; std: number | null } | null }
+  associations?: { egr_excursion_nearby?: boolean | null; map_change?: { change: number } | null; egr_cmd_change?: { change: number } | null }
+  evidence: { t_rel_s: number; value_gs: number; raw_hex: string; response: string | null; ecu: string | null }[]
+  limitations: string[]
+}
+export interface AirPathDtc {
+  code: string; family: string; air_path_relevance: 'air_path_family' | 'unknown' | 'other_family'; description: string | null
+  description_status: string; note: string; ecus: (string | null)[]; statuses: string[]; scan_phases: string[]; timing: string
+}
+export interface AirPath {
+  status: 'evaluated' | 'maf_not_available'
+  signals: Record<string, AirPathSignal>
+  running_s: number
+  maf: {
+    samples_ok: number; failed_reads: { n: number; by_quality: Record<string, number> }
+    running_state?: { running_confirmed: number; engine_not_running: number; unknown: number; note: string }
+    zero_running?: number; low_running?: number; zero_per_1k_running?: number | null; low_per_1k_running?: number | null
+    zero_engine_not_running?: number; low_running_state_unknown?: number
+    episodes: MafEpisode[]; episode_count?: number; episode_total_s?: number; persistent_episodes?: number; transient_episodes?: number
+    repeated_clusters?: number; dips: DetectedEvent[]
+    by_temperature?: Record<'cold' | 'warm' | 'unknown', AirPathGroup>; by_motion?: Record<'idle' | 'moving' | 'unknown', AirPathGroup>
+  }
+  egr_error: {
+    samples: number; count: number | null; per_running_h: number | null; max_abs_pct?: number | null; screen_pct?: number
+    positive?: number; negative?: number; both_directions?: number
+    excursions: { t_start_rel_s: number; t_end_rel_s: number; max_abs_pct: number; direction: string; motion: string; load_band: string }[]
+  }
+  correlations: { supporting: string[]; contradicting: string[]; note: string; symptom_markers: { event: string; t_rel_s: number; near_air_path_anomaly: boolean | null }[] }
+  dtcs: {
+    scans: { phase: string; t_rel_s: number | null; mil_on: boolean | null }[]; codes: string[]; by_code: AirPathDtc[]
+    mil_on: boolean | null; owner_reported_manufacturer_codes: { code: string; system: string | null; source: string }[]
+    owner_reported_note: string; notes: string[]
+  }
+  limitations: string[]
+  heuristics: Record<string, number>
+  history?: { other_sessions: number; medians: Record<string, number | null> | null; note: string }
+}
+/** compact per-session air-path statistics; null = unavailable (never zero) */
+export interface AirPathRow {
+  maf_status: string; running_h: number | null; maf_running_samples: number | null; maf_zero_running: number | null
+  maf_low_running: number | null; maf_zero_per_1k: number | null; maf_low_per_1k: number | null; maf_episodes: number | null
+  maf_episodes_per_h: number | null; maf_episode_total_s: number | null; maf_dips: number | null
+  cold: AirPathGroup | null; warm: AirPathGroup | null; idle: AirPathGroup | null; moving: AirPathGroup | null
+  rpm_unstable_episodes: number | null; egr_status: string; egr_excursions: number | null; egr_excursions_per_h: number | null
+  egr_max_abs_pct: number | null; dtc_scanned: boolean; dtcs: string[] | null; mil_on: boolean | null
+  symptom_markers: number; symptom_markers_near_anomaly: number
+  vs_cohort?: { other_sessions: number; medians: Record<string, number | null> | null; note: string }
+}
+export interface AirPathTrend {
+  cohort: { vehicle_profile: string; origin: 'real' | 'synthetic'; vehicle_identity: string | null } | null
+  sessions: number; sessions_with_maf: number; sessions_scanned: number
+  series: { id: string; started_at: number; drive_type: string | null; maf_zero_per_1k: number | null; maf_low_per_1k: number | null
+    maf_episodes_per_h: number | null; egr_excursions_per_h: number | null; maf_episodes: number | null; dtcs: string[] | null; mil_on: boolean | null }[]
+  medians: Record<string, number | null>
+  by_drive_type: Record<string, { sessions: number } & Record<string, number | null>>
+  cold: AirPathGroup | null; warm: AirPathGroup | null; idle: AirPathGroup | null; moving: AirPathGroup | null
+  dtc_recurrence: { code: string; sessions: number; share_of_scanned_sessions: number; first_seen: number; last_seen: number }[]
+  mil_on_sessions: number; note: string
 }
 export interface HistoryRow {
   id: string; started_at: number; label: string; synthetic: boolean; aborted: string | null; drive_type: string | null
@@ -189,5 +258,6 @@ export interface HistoryRow {
   fan_durations_s: (number | null)[]; battery_warnings: number; possible_regenerations: number
   possible_interrupted_regenerations: number; user_suspected_regenerations: number; coolant_max_c: number | null
   ecu_voltage_running_median: number | null; adapter_voltage_running_median: number | null; link_events: number
+  air_path?: AirPathRow
 }
 export interface LiveSignal { pid: number; name: string; unit: string | null; value: number | null; quality: string; at: number; points: Point[]; attempts: number; ok: number; first: number }
