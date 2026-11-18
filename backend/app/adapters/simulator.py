@@ -20,6 +20,8 @@ from app.parameters.standard_pids import BITMAP_PIDS, encode_dtc
 
 SYNTHETIC_VIN = "SYNTHETICVIN00001"
 SYNTHETIC_CAL = "SYNTHETIC-CAL-01"
+SYNTHETIC_CVN = bytes.fromhex("5EC0FFEE")
+SYNTHETIC_ECU_NAME = b"ECM\x00-SyntheticEngi\x00\x00"  # 20 bytes, SAE J1979 layout (invented text)
 
 
 def _clamp(v: float, lo: int, hi: int) -> int:
@@ -83,6 +85,9 @@ class Scenario:
     ecu_online: Callable[[float], bool] | None = None
     # t -> adapter supply voltage for ATRV (None: constant 14.1 V). Adapter-local, works with the ECU asleep.
     adapter_voltage: Callable[[float], float] | None = None
+    # what the fake adapter claims about itself (ATZ / ATI / AT@1); clones print anything
+    adapter_identity: str = "ELM327 v2.3"
+    adapter_description: str = "SYNTHETIC ELM327 SIMULATOR"
 
 
 # -- synthetic signal generators ------------------------------------------------
@@ -365,6 +370,11 @@ SCENARIOS: dict[str, Scenario] = {
         Scenario("mini_ecu_silent_running", "Synthetic: the ECU stops answering while the engine was running",
                  MINI, **_drive(ECU_SILENT)),
         Scenario(
+            "mini_dde_capability",
+            "Synthetic DDE capability check: service 09 calibration ID / CVN / ECU name answered multi-frame",
+            MINI, _diesel(), stored=("P115D",), mil=True, mode09=(0x02, 0x04, 0x06, 0x0A),
+        ),
+        Scenario(
             "porsche_healthy_idle", "Synthetic petrol flat-six idle over K-line (ISO 9141-2)", PORSCHE,
             _petrol_flat6(), family="kline", protocol_number="3", protocol_name="ISO 9141-2",
             compression_ignition=False, mode0a=False, mode06="no_data", second_ecu=False, delay=(0.08, 0.14),
@@ -425,7 +435,7 @@ class ElmSimulator:
         eol = "\r\n" if self.linefeed else "\r"
         out = (command + eol if self.echo and cmd != "ATZ" else "") + eol.join(lines) + eol + eol + ">"
         if cmd == "ATZ":
-            out = eol + eol + "ELM327 v2.3" + eol + eol + ">"
+            out = eol + eol + self.scenario.adapter_identity + eol + eol + ">"
         return out.encode("latin-1"), delay
 
     # -- AT -------------------------------------------------------------------
@@ -433,11 +443,11 @@ class ElmSimulator:
         sc = self.scenario
         if cmd == "ATZ":
             self._reset()
-            return ["ELM327 v2.3"]
+            return [sc.adapter_identity]
         if cmd == "ATI":
-            return ["ELM327 v2.3"]
+            return [sc.adapter_identity]
         if cmd == "AT@1":
-            return ["SYNTHETIC ELM327 SIMULATOR"]
+            return [sc.adapter_description]
         if cmd in ("ATE0", "ATE1"):
             self.echo = cmd.endswith("1")
         elif cmd in ("ATL0", "ATL1"):
@@ -546,6 +556,10 @@ class ElmSimulator:
                     padded = (b"\x00" * 3 + text) if it == 0x02 else text
                     for n, i in enumerate(range(0, len(padded), 4), start=1):
                         msgs.append((eng, bytes([0x49, it, n]) + padded[i : i + 4]))
+            elif it in sc.mode09 and it == 0x06 and can:
+                msgs.append((eng, bytes([0x49, 0x06, 0x01]) + SYNTHETIC_CVN))
+            elif it in sc.mode09 and it == 0x0A and can:
+                msgs.append((eng, bytes([0x49, 0x0A, 0x01]) + SYNTHETIC_ECU_NAME))
         elif mode == 0x04:
             self.dtcs_cleared = True  # a real ECU would have erased fault memory here
             msgs.append((eng, b"\x44"))

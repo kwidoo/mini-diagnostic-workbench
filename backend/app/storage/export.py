@@ -273,6 +273,19 @@ def render_report(
         out += [f"- VIN: {vi.get('vin') or vi.get('vin_status')} | calibration ID(s): {cal}"]
     if meta.get("aborted"):
         out += [f"- **Session ended early:** {meta['aborted']}"]
+    cap = meta.get("dde_capability")
+    if cap:
+        v = cap["verdicts"]
+        out += [
+            "",
+            "## DDE capability",
+            "",
+            f"- Generic OBD: {v['generic_obd']['verdict']}",
+            f"- Manufacturer transport: {v['manufacturer_transport']['verdict']} "
+            f"({v['manufacturer_transport']['meaning']})",
+            f"- Manufacturer-specific requests sent: {cap['dde']['manufacturer_requests_sent']['value']}",
+            "- Details: dde_capability.md / dde_capability.json",
+        ]
     out += ["", "## Fault scans", ""]
     if not scans:
         out += ["No fault scan in this session.", ""]
@@ -433,6 +446,17 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
                 "vehicle_profile.json": dump(prof.to_dict()),
             }
         )
+    cap = session["meta"].get("dde_capability")
+    if cap:
+        from app.manufacturer.bmw.capability import render_markdown
+
+        files["README.txt"] += (
+            "\nDDE capability assessment (generic OBD + adapter identity only; no manufacturer request):\n"
+            "dde_capability.json    observed / claimed / unknown fields with sources and verdicts\n"
+            "dde_capability.md      the same as a table for review\n"
+        )
+        files["dde_capability.json"] = dump(cap)
+        files["dde_capability.md"] = render_markdown(cap)
     if vin and not include_vin:
         files = {k: v.replace(vin, REDACTED) for k, v in files.items()}
     return files

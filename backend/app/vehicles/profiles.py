@@ -253,6 +253,11 @@ MINI_R60_DIESEL = VehicleProfile(
         "Stop immediately on metallic knocking, overheating, exhaust/coolant smell or a flashing MIL.",
     ),
     monitoring_events=MINI_MONITORING_EVENTS,
+    hardware_validation_note=(
+        "Not hardware-validated as a whole. Generic OBD over CAN 11/500 was observed on this vehicle in real "
+        "recordings (2026-11-18: ECUs 7E8/7E9, services 01/02/03/06); ISO-TP multi-frame and service 09 "
+        "identification are not yet observed, and BMW DDE data is not read (docs/DDE_CAPABILITY.md)."
+    ),
 )
 
 PORSCHE_986 = VehicleProfile(

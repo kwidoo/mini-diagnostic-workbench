@@ -2,7 +2,9 @@
 
 Status words: **implemented** (code + tests against the simulator), **raw only**
 (bytes stored, no physical value shown), **unavailable** (no request is sent).
-Nothing in this table has been validated on a real car yet.
+Real-car evidence so far (MINI, 2026-11-18 recordings): CAN 11/500, two answering ECUs,
+service 01 / 02 / 03 / 06 discovery and reads, `ATRV`. Everything else in this table is
+simulator-tested only. DDE readiness of the adapter: [DDE_CAPABILITY.md](DDE_CAPABILITY.md).
 
 Three things are reported separately and never merged into one "complete" flag:
 generic OBD support (this table), manufacturer DDE/DME diagnostics (not implemented:

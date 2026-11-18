@@ -75,6 +75,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-freeze-frame", action="store_true")
     p.add_argument("--label", default="")
+    p = sub.add_parser(
+        "dde-capability",
+        help="DDE-01: assess adapter + engine ECU identity for BMW DDE access (generic OBD only; "
+        "no manufacturer request). With --session: assess a stored session offline, read-only",
+    )
+    _connection_args(p)
+    p.add_argument("--read-vin", action="store_true", help="also read the VIN (never shown in the report)")
+    p.add_argument("--label", default="")
+    p.add_argument(
+        "--session",
+        default=None,
+        help="assess a stored session instead of connecting (id or 'latest'); nothing is changed",
+    )
+    p.add_argument("--out", default=None, help="also write the report: *.json or *.md")
     p = sub.add_parser("inventory", help="list supported PIDs and read each once")
     _connection_args(p)
     p.add_argument("--read-vin", action="store_true")
@@ -401,6 +415,42 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             print(
                 f"  VIN: {vi['vin'] or vi['vin_status']}; calibration: {', '.join(c['text'] for c in vi['calibration_ids']) or 'not reported'}"
             )
+        return 0
+
+    if a.cmd == "dde-capability":
+        from app.manufacturer.bmw.capability import assess_session, render_markdown, report_rows
+
+        if a.session:
+            sid = _resolve(store, a.session)
+            report = assess_session(store, sid)
+        else:
+            _connect(wb, a)
+            sid = wb.dde_capability(a.label, a.read_vin)
+            report = store.get_session(sid)["meta"]["dde_capability"]
+        if a.out:
+            out = Path(a.out)
+            out.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n"
+                if out.suffix == ".json"
+                else render_markdown(report),
+                encoding="utf-8",
+            )
+            print(f"wrote {out}", file=sys.stderr)
+        if a.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        v = report["verdicts"]
+        print(f"session {sid}" + ("  [SYNTHETIC DATA]" if report["synthetic"] else ""))
+        print(f"generic OBD           : {v['generic_obd']['verdict']}")
+        print(f"manufacturer transport: {v['manufacturer_transport']['verdict']}")
+        for b in v["manufacturer_transport"]["blockers"]:
+            print(f"  blocker   : {b}")
+        for b in v["manufacturer_transport"]["unverified"]:
+            print(f"  unverified: {b}")
+        for name, val, quality, src in report_rows(report):
+            print(f"  {name:<34}{quality:<14}{val[:60]:<62}{src}")
+        if not a.session:
+            print(f"export for review (VIN redacted): mini-obd export --session {sid}", file=sys.stderr)
         return 0
 
     if a.cmd == "inventory":

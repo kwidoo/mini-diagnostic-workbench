@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { reactive, watch } from 'vue'
+import DdeCapabilityPanel from '../components/DdeCapabilityPanel.vue'
 import { useWorkbench } from '../stores/workbench'
 
 const wb = useWorkbench()
@@ -33,8 +34,8 @@ function save() {
             <span class="badge" data-test="cap-manufacturer" :class="p.capabilities.manufacturer_diagnostics === 'available' ? '' : 'text-warn'">
               Manufacturer {{ p.make === 'Porsche' ? 'DME' : 'DDE' }} data: {{ p.capabilities.manufacturer_diagnostics === 'available' ? 'available' : 'not read by this tool' }}
             </span>
-            <span class="badge" data-test="cap-hardware" :class="p.capabilities.hardware_validated ? 'text-good' : 'text-warn'">
-              {{ p.capabilities.hardware_validated ? 'hardware-validated' : 'NOT hardware-validated (simulator only)' }}
+            <span class="badge" data-test="cap-hardware" :title="p.capabilities.hardware_validation_note" :class="p.capabilities.hardware_validated ? 'text-good' : 'text-warn'">
+              {{ p.capabilities.hardware_validated ? 'hardware-validated' : 'NOT hardware-validated' }}
             </span>
           </div>
         </button>
@@ -83,6 +84,8 @@ function save() {
         </ul>
         <p class="mt-1 text-ink-2">{{ wb.vehicle.owner_reported.notes }}</p>
       </section>
+
+      <DdeCapabilityPanel v-if="wb.profile.ecus.some((e) => e.id.startsWith('bmw-dde'))" />
 
       <section v-for="ext in wb.profile.manufacturer" :key="ext.id" class="panel text-sm" data-test="manufacturer">
         <h2 class="h2">Manufacturer-specific data: {{ ext.enabled ? 'enabled' : 'not available' }}</h2>

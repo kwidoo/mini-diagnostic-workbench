@@ -261,3 +261,24 @@ export interface HistoryRow {
   air_path?: AirPathRow
 }
 export interface LiveSignal { pid: number; name: string; unit: string | null; value: number | null; quality: string; at: number; points: Point[]; attempts: number; ok: number; first: number }
+
+/** DDE-01 capability report: every field says where it came from and how much it is worth. */
+export type CapQuality = 'observed' | 'claimed' | 'derived' | 'not_supported' | 'not_attempted' | 'failed' | 'unknown'
+export interface CapField {
+  value: unknown; quality: CapQuality; source: string | null; detail: string; exchange_seq?: number | null
+}
+export type ManufacturerTransportVerdict =
+  | 'manufacturer_transport_blocked' | 'manufacturer_transport_unverified' | 'manufacturer_transport_candidate'
+export interface DdeCapabilityReport {
+  format: string; session_id: string | null; assessed_at: number; source: string; synthetic: boolean
+  adapter: Record<'identity' | 'device_description' | 'claimed_elm_version' | 'supply_voltage' | 'chip', CapField> & { notes: string[] }
+  protocol: Record<'number' | 'name' | 'can_11bit_500k', CapField>
+  ecus: { source_id: string; primary: boolean; mode01_pids: number; mode09_infotypes: string[]; role: string }[]
+  identification: Record<string, CapField>
+  isotp_multiframe: CapField
+  dde: Record<'variant' | 'software_version' | 'manufacturer_requests_sent', CapField>
+  verdicts: {
+    generic_obd: { verdict: string; reasons: string[] }
+    manufacturer_transport: { verdict: ManufacturerTransportVerdict; blockers: string[]; unverified: string[]; meaning: string }
+  }
+}

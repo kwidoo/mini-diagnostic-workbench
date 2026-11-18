@@ -25,6 +25,14 @@ service or data identifiers.
 `ATZ` resets the adapter, not the car. `ATSP0` asks the adapter to auto-detect the
 protocol; on K-line vehicles that involves the normal OBD bus initialisation.
 
+## DDE capability check
+
+`mini-obd dde-capability` / Vehicle -> "Run capability check" sends only requests that
+were already allowed: service 09 InfoTypes 04 (calibration ID), 06 (CVN) and 0A (ECU
+name), plus 02 (VIN) with explicit consent. It adds no request type and no adapter
+command. The report counts any request outside the allowlist found in the session
+trace (must be 0). Details: DDE_CAPABILITY.md.
+
 ## Continuous monitoring
 
 - No new request type: monitoring uses the same allowlisted generic OBD reads plus the

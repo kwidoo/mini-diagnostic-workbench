@@ -492,6 +492,50 @@ class ObdClient:
             info["vin_status"] = "read" if vins else "no_data"
         return info
 
+    def identification(self, include_vin: bool = False) -> dict[str, dict[str, object]]:
+        """Service 09 identification InfoTypes that the allowlist permits: calibration ID (04),
+        CVN (06), ECU name (0A) and - only with explicit consent - the VIN (02).
+
+        Every InfoType gets an explicit status: ``read`` (positive answer, raw bytes kept),
+        ``not_supported`` (the ECUs did not advertise it), ``not_attempted`` (VIN without
+        consent), ``no_data`` / ``negative`` / ``timeout`` / ``error`` / ``disconnected``
+        (requested, no usable answer). Nothing is decoded beyond printable text.
+        """
+        supported = {p for e in self._caps().ecus for p in e.mode09_pids}
+        out: dict[str, dict[str, object]] = {}
+        for infotype, key in ((0x04, "calibration_id"), (0x06, "cvn"), (0x0A, "ecu_name"), (0x02, "vin")):
+            entry: dict[str, object] = {"infotype": f"{infotype:02X}", "answers": []}
+            if infotype not in supported:
+                entry["status"] = "not_supported"
+            elif infotype == 0x02 and not include_vin:
+                entry["status"] = "not_attempted"
+                entry["detail"] = "VIN is read only with explicit consent"
+            else:
+                ex, reply, msgs, problems = self.query(AllowedCommand.obd(0x09, infotype))
+                good = _positive(msgs, bytes([0x49, infotype])) if reply.status == ElmStatus.OK else []
+                if not good:
+                    q, d = _failure_quality(ex, reply, msgs, problems)
+                    entry["status"], entry["detail"] = q, d
+                else:
+                    by_ecu: dict[str, bytes] = {}
+                    for m in good:
+                        by_ecu[m.ecu] = by_ecu.get(m.ecu, b"") + m.payload[3:]
+                    entry["status"] = "read"
+                    entry["answers"] = [
+                        {
+                            "ecu": e,
+                            "raw_hex": b.hex().upper(),
+                            # printable text only for text InfoTypes; CVNs are binary checksums
+                            "text": None
+                            if infotype == 0x06
+                            else b.replace(b"\x00", b"").decode("latin-1").strip(),
+                        }
+                        for e, b in by_ecu.items()
+                    ]
+                entry["exchange_seq"] = ex.seq
+            out[key] = entry
+        return out
+
     def monitors(self) -> list[dict[str, str]]:
         """Service 06 results, raw. Scaling (unit-and-scaling IDs) is not decoded."""
         out: list[dict[str, str]] = []

@@ -272,7 +272,12 @@ class Workbench:
     # -- sessions ----------------------------------------------------------------
     @contextmanager
     def _session(self, kind: str, label: str):
-        what = {"scan": "scan", "snapshot": "inventory", "record": "recording"}[kind]
+        what = {
+            "scan": "scan",
+            "snapshot": "inventory",
+            "record": "recording",
+            "capability": "DDE capability assessment",
+        }[kind]
         with self._exclusive(what):
             client = self._need_client()
             if self.connected_profile != self.profile.id:  # e.g. changed by another process
@@ -396,6 +401,49 @@ class Workbench:
             meta["vehicle_info"] = client.vehicle_info(read_vin)
             meta["monitors"] = client.monitors()
         return sid
+
+    def dde_capability(self, label: str = "", read_vin: bool = False) -> str:
+        """DDE-01: repeatable capability assessment on the existing connection.
+
+        Sends only what the generic allowlist already permits: service 09 identification
+        InfoTypes (calibration ID, CVN, ECU name; VIN only with consent). No manufacturer
+        request exists on this path. The report is computed from the session's own raw trace
+        (including the adapter initialisation) and stored in ``meta["dde_capability"]``.
+        """
+        from app.manufacturer.bmw.capability import assess
+
+        with self._session("capability", label) as (sid, client, meta):
+            self._phase = "capability"
+            ident = client.identification(include_vin=read_vin)
+            if read_vin:
+                vins = ident["vin"].get("answers") or []
+                meta["vehicle_info"] = {
+                    "vin": vins[0]["text"] if vins else None,
+                    "vin_status": "read" if vins else ident["vin"]["status"],
+                    "calibration_ids": [
+                        {k: a[k] for k in ("ecu", "text", "raw_hex")}
+                        for a in ident["calibration_id"].get("answers") or []
+                    ],
+                }
+            self._flush()
+            meta["dde_capability"] = assess(
+                adapter=client.adapter.model_dump(),
+                capabilities=client.capabilities.model_dump() if client.capabilities else None,
+                exchanges=self.store.exchanges(sid),
+                source=self.source,
+                synthetic=self.source != "real",
+                session_id=sid,
+                assessed_at=client.transport.clock.wall(),
+            )
+        return sid
+
+    def latest_dde_capability(self, profile_id: str | None = None) -> dict[str, Any] | None:
+        """Most recent stored capability report for a vehicle profile (None if never run)."""
+        prof = get_profile(profile_id) if profile_id else self.profile
+        for s in reversed(self.store.list_sessions(prof.id, order="rowid")):
+            if s["kind"] == "capability" and s["meta"].get("dde_capability"):
+                return s["meta"]["dde_capability"]
+        return None
 
     def recording_profile(self, profile_id: str) -> RecordingProfile:
         return self.profile.recording_profile(profile_id)

@@ -245,6 +245,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ],
         }
 
+    # -- DDE capability (DDE-01): generic OBD + adapter identity only ------------------
+    @app.post("/api/dde/capability")
+    def dde_capability(body: ScanBody) -> dict[str, Any]:
+        sid = wb.dde_capability(body.label, body.read_vin)
+        detail = _session_detail(store, sid)
+        return {**detail, "report": detail["meta"]["dde_capability"]}
+
+    @app.get("/api/dde/capability/latest")
+    def dde_capability_latest() -> dict[str, Any]:
+        return {"vehicle_profile": wb.profile.id, "report": wb.latest_dde_capability()}
+
+    @app.get("/api/sessions/{sid}/dde-capability")
+    def dde_capability_offline(sid: str) -> dict[str, Any]:
+        from app.manufacturer.bmw.capability import assess_session
+
+        return assess_session(store, sid)  # read-only: recomputed from the stored trace
+
     @app.get("/api/recording/plan")
     def plan(profile: str = "idle") -> dict[str, Any]:
         p = wb.plan_recording(profile)

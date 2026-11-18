@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../api'
 import type {
-  AirPathTrend, Annotation, Comparison, Finding, HistoryRow, Inventory, LiveSignal, MonitoringSummary, MonitorState, Plan, Profile, Reading,
+  AirPathTrend, Annotation, Comparison, DdeCapabilityReport, Finding, HistoryRow, Inventory, LiveSignal, MonitoringSummary, MonitorState, Plan, Profile, Reading,
   Series, SessionDetail, SessionSummary, Status, VehicleRecord,
 } from '../types'
 
@@ -42,6 +42,8 @@ interface State {
   history: HistoryRow[]
   /** multi-session air-path statistics per cohort (real / synthetic never pooled) */
   airPathTrends: AirPathTrend[]
+  /** latest DDE-01 capability report of the active vehicle (generic OBD + adapter identity only) */
+  ddeCapability: DdeCapabilityReport | null
 }
 
 let socket: WebSocket | null = null
@@ -52,6 +54,7 @@ export const useWorkbench = defineStore('workbench', {
     lastScan: null, inventory: null, plan: null, live: {}, liveSessionId: null, liveMarkers: [], wsState: 'closed',
     current: null, currentSeries: null, findings: [], findingsFor: null, comparison: null, fixtures: [],
     liveEvents: [], monitoring: null, monitoringSeries: null, history: [], airPathTrends: [],
+    ddeCapability: null,
   }),
   getters: {
     profile: (s): Profile | null => s.profiles.find((p) => p.id === s.activeProfileId) ?? null,
@@ -155,6 +158,21 @@ export const useWorkbench = defineStore('workbench', {
     async scan(readVin: boolean) {
       await this.run('scanning', async () => {
         this.lastScan = await api.post<SessionDetail>('/api/scan', { read_vin: readVin })
+        await this.loadSessions()
+      })
+    },
+    /** Latest stored capability report; quiet on failure (an older backend has no such route). */
+    async loadDdeCapability() {
+      try {
+        this.ddeCapability = (await api.get<{ report: DdeCapabilityReport | null }>('/api/dde/capability/latest')).report
+      } catch {
+        this.ddeCapability = null
+      }
+    },
+    async runDdeCapability(readVin = false) {
+      await this.run('DDE capability assessment', async () => {
+        const r = await api.post<SessionDetail & { report: DdeCapabilityReport }>('/api/dde/capability', { read_vin: readVin })
+        this.ddeCapability = r.report
         await this.loadSessions()
       })
     },

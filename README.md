@@ -19,11 +19,15 @@ regeneration, codes or programs anything. See [docs/SAFETY.md](docs/SAFETY.md).
 
 Details: [docs/OBD_SUPPORT_MATRIX.md](docs/OBD_SUPPORT_MATRIX.md).
 
-**Not yet validated on a car.** Everything was built and tested against the built-in
-fake ELM327. The first real connection is the test of the adapter assumptions listed
-in [docs/DIAGNOSTIC_PROTOCOL.md](docs/DIAGNOSTIC_PROTOCOL.md).
+**Real-car status.** Generic OBD over CAN (11-bit, 500 kbit/s) has been observed on the
+MINI in real recordings since 2026-11-18 (adapter `ELM327 v2.2` claim, ECUs `7E8` / `7E9`,
+service 01 / 02 / 03 / 06 discovery, stored `P115D`): see
+[docs/DDE_CAPABILITY.md](docs/DDE_CAPABILITY.md). That is not a full hardware validation
+(ISO-TP multi-frame, service 09 identification and K-line on the Porsche are still
+unobserved), so no profile carries the `hardware_validated` flag. The adapter assumptions
+are listed in [docs/DIAGNOSTIC_PROTOCOL.md](docs/DIAGNOSTIC_PROTOCOL.md).
 Profile status `generic_obd_ready` means generic OBD only: manufacturer DDE/DME
-diagnostics are not implemented, and no profile is hardware-validated yet. Follow the
+diagnostics are not implemented. Follow the
 checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
 real session.
 
@@ -77,6 +81,8 @@ mini-obd probe --host 192.168.0.10 --port 35000 # adapter identity, protocol, EC
 mini-obd scan                                   # stored / pending / permanent DTCs + freeze frame
 mini-obd scan --read-vin                        # also read the VIN (kept local)
 mini-obd inventory                              # which PIDs the ECU supports, each read once
+mini-obd dde-capability                         # DDE-01: adapter + ECU identity report, no BMW request
+mini-obd dde-capability --session <id>          # same, offline from a stored session (read-only)
 mini-obd record --duration 120 --profile idle   # timed recording with pre/post fault scans
 mini-obd record --profile mini_extended_monitoring --until-stop   # continuous; Ctrl-C stops and saves
 mini-obd annotate --event fan_running           # predefined event (also while another process records)
@@ -94,7 +100,7 @@ adapter (`healthy_idle`, `rough_idle`, `egr_mismatch`, `dpf_history`, `wifi_drop
 `unsupported_pids`, `slow_adapter`, `porsche_healthy_idle`, `porsche_bank_imbalance`, and the
 synthetic drive cycles `mini_city_drive`, `mini_highway_drive`, `mini_warmup`,
 `mini_dpf_regen_possible`, `mini_shutdown_during_regen`, `mini_voltage_drop`,
-`mini_ignition_off`, `mini_ecu_silent_running`). Continuous monitoring: docs/MONITORING.md.
+`mini_ignition_off`, `mini_ecu_silent_running`, `mini_dde_capability`). Continuous monitoring: docs/MONITORING.md.
 Add `--vehicle porsche-boxster-986-mk2` before the command for the other profile.
 
 ## First run on the actual MINI
