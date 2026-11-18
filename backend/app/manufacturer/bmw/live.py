@@ -162,3 +162,30 @@ class DdeLiveReader:
                 }
             )
         return out
+
+
+def monitoring_plan(live: DdeLiveReader, tiers: Any) -> list[dict[str, Any]]:
+    """DDE-06: capability-driven manufacturer items for the monitoring scheduler. Live values only
+    (identification is not polled), never in the fast tier: P0 values at the medium interval (or
+    their documented interval, whichever is longer), everything else slow. The scheduler stretches
+    these further when the adapter is slow (bounded share of link time)."""
+    out = []
+    for metric, e in live.entries.items():
+        if e.kind != "live_value":
+            continue
+        want = e.sample_interval_s or tiers.slow_s
+        tier = "medium" if e.priority == "P0" and want <= tiers.medium_s * 1.5 else "slow"
+        base = max(want, tiers.medium_s if tier == "medium" else tiers.slow_s)
+        out.append(
+            {
+                "metric": metric,
+                "title": e.title,
+                "request_id": e.request_id,
+                "priority": e.priority,
+                "tier": tier,
+                "base_interval_s": base,
+                "unit": e.response.unit if e.response else None,
+                "semantics": e.semantics,
+            }
+        )
+    return out
