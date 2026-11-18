@@ -89,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="assess a stored session instead of connecting (id or 'latest'); nothing is changed",
     )
     p.add_argument("--out", default=None, help="also write the report: *.json or *.md")
+    sub.add_parser(
+        "dde-catalog", help="DDE-02: BMW DDE request catalog - per metric executable / blocked and why"
+    )
     p = sub.add_parser("inventory", help="list supported PIDs and read each once")
     _connection_args(p)
     p.add_argument("--read-vin", action="store_true")
@@ -451,6 +454,22 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             print(f"  {name:<34}{quality:<14}{val[:60]:<62}{src}")
         if not a.session:
             print(f"export for review (VIN redacted): mini-obd export --session {sid}", file=sys.stderr)
+        return 0
+
+    if a.cmd == "dde-catalog":
+        from app.manufacturer.bmw.catalog import ExecutionContext, default_catalog
+
+        cat = default_catalog()
+        desc = cat.describe(ExecutionContext())
+        if a.json:
+            print(json.dumps(desc, indent=2))
+            return 0
+        n_exec = sum(m["status"] == "executable" for m in desc["availability"])
+        print(f"catalog {cat.version}: {n_exec} executable of {len(desc['availability'])} metrics")
+        for m in desc["availability"]:
+            print(
+                f"  {m.get('priority', '-'):<3}{m['metric']:<30}{m['status']:<11}{(m['reasons'] or [''])[0][:70]}"
+            )
         return 0
 
     if a.cmd == "inventory":

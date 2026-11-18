@@ -252,6 +252,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         detail = _session_detail(store, sid)
         return {**detail, "report": detail["meta"]["dde_capability"]}
 
+    @app.get("/api/dde/catalog")
+    def dde_catalog() -> dict[str, Any]:
+        from app.manufacturer.bmw.catalog import ExecutionContext, default_catalog
+
+        return default_catalog().describe(ExecutionContext())
+
     @app.get("/api/dde/capability/latest")
     def dde_capability_latest() -> dict[str, Any]:
         return {"vehicle_profile": wb.profile.id, "report": wb.latest_dde_capability()}

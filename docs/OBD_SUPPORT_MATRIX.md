@@ -88,6 +88,8 @@ to DPF or EGR data and needs no manufacturer protocol.
   tested. Turning a parameter on requires: ECU variant identified from the car, a
   documented source for the request and scaling, recorded fixtures, and a reviewed
   change to the allowlist.
+- The request manifest and its evidence matrix are in DDE_REQUEST_CATALOG.md: every wanted
+  metric is listed, none is executable, each with the steps that would unblock it.
 - Practical suggestion: have a workshop or a BMW-capable tool read the DDE fault memory
   and the DPF / EGR live values once, and keep that printout next to these sessions.
 
