@@ -62,6 +62,20 @@ MONITORING_FIXTURES: dict[str, tuple[str, float, list[tuple[float, str, str]]]] 
 }
 
 
+#: anonymised stand-in for the first real recording (session 20261118-143936-c028): same format as
+#: MONITORING_FIXTURES, kept apart because it exercises the air path, not shutdown / fan behaviour
+AIR_PATH_FIXTURES: dict[str, tuple[str, float, list[tuple[float, str, str]]]] = {
+    "mini_air_path_anomalies": (
+        "mini-monitoring-air-path",
+        600,
+        [
+            (245, "unusual_engine_noise", "synthetic manual marker"),
+            (402, "rough_idle", "synthetic manual marker"),
+        ],
+    ),
+}
+
+
 def record_monitoring(
     store: Store, scenario: str, duration_s: float, marks: list[tuple[float, str, str]], seed: int = 1
 ) -> str:
@@ -85,7 +99,7 @@ def generate(out_dir: str | Path, only: str | None = None) -> list[Path]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     paths = []
-    for scenario, (stem, duration, mmarks) in MONITORING_FIXTURES.items():
+    for scenario, (stem, duration, mmarks) in {**MONITORING_FIXTURES, **AIR_PATH_FIXTURES}.items():
         if only and stem != only:
             continue
         store = Store(":memory:")

@@ -2,8 +2,9 @@
 
 Continuous, read-only recording across daily drives, to investigate the radiator fan
 running after shutdown, possibly interrupted DPF regenerations, recurring low-battery
-warnings, DPF / EGR / intake / temperature relationships, and the owner-reported BMW
-DDE faults 480A and 4862.
+warnings, DPF / EGR / intake / temperature relationships, recurring air-path anomalies
+(MAF / EGR / MAP, generic DTCs such as P115D), and the owner-reported BMW DDE faults
+480A and 4862.
 
 **Status: simulator-tested only.** Nothing here has been run on the real MINI or the
 real Vgate adapter. Every claim below about behaviour on the car is an expectation
@@ -185,6 +186,90 @@ car's own history, not BMW / MINI limits.
 - Findings `monitoring_*` appear only for monitoring sessions and never exceed
   `suggestive`.
 
+## Air path: MAF / EGR / MAP / DTC (derived automatically)
+
+Nothing to start or press: every monitoring session (also older ones, and replays of an
+exported `transcript.jsonl`) is analysed when its summary, report or export is built. The
+recording profile, its tiers and its request load are unchanged: no extra PID, no second
+sampling loop, no extra DTC polling. All raw samples (timestamp, ECU, quality, raw bytes,
+failed reads) stay exactly as recorded; the analysis only reads them. Code:
+`backend/app/diagnostics/air_path.py`, thresholds in `HEURISTICS` (`monitoring.py`, keys
+`airpath_*`, `maf_*`, `egr_error_screen_pct`), also exported in `monitoring.json`.
+
+**Engine confirmed running.** A MAF sample is judged only if measured RPM right before *and*
+right after it (each at most 3 s away) is >= 600 rpm. Both below 300 rpm = engine not
+running (a zero is then expected and only counted separately). Anything else (stale or
+missing RPM, ECU silence, cranking, a stop between the two RPM samples) = *unknown*, not
+judged. A failed read (NO DATA, timeout, disconnect, negative answer) has no value and is
+never a zero; an unsupported or unrecorded signal is `not available` and its statistics are
+`null`, never 0.
+
+| Result | Rule (screening heuristic, not a manufacturer value) |
+|---|---|
+| zero MAF while running | decoded MAF exactly 0.00 g/s (raw answer `41 10 00 00` is kept as evidence) |
+| low MAF while running | MAF < 1 g/s |
+| episode | low-MAF running samples < 5 s apart with no normal MAF in between; *persistent* if >= 3 s or >= 3 samples, else *single transient*; *repeated* if another episode starts within 120 s |
+| abrupt dip | MAF falls to <= 50 % of the previous running sample (>= 2 g/s) and is back to >= 80 % within 3 s while RPM changed <= 10 % (excludes most gear changes; driver inputs remain possible) |
+| EGR-error excursion | running samples with \|PID 2D\| >= 15 %, < 10 s apart = one excursion (an oscillation through zero stays one, direction "both") |
+| cold / warm | coolant (held value <= 30 s old) below / at or above 60 °C, fixed so drives stay comparable |
+| idle / moving | speed (held value <= 5 s old) 0 / above 0 |
+
+Each episode keeps start/end time, duration, every MAF value with its raw answer, ECU and
+latency (first 20), RPM before/after with their ages, RPM spread in +/-5 s, and speed,
+coolant, MAP, load, commanded EGR and EGR error as **held values with their age** and a
+`fresh` flag. PIDs are polled one after another; a value older than its limit is marked
+stale and is not used for an association. Episodes and dips go to `detected_events.json`
+(origin `inferred`, status `candidate`) and are shaded on the session charts.
+
+**Associations, not causes.** For every episode: an EGR-error excursion within +/-5 s (and,
+as a rough chance level, how often any running MAF sample had one that close), a MAP change
+of >= 5 kPa or a commanded-EGR change of >= 10 % against the 15 s before, idle-RPM
+instability (std >= 30 rpm and >= 2x the session's usual idle-window spread; stationary
+only), and manual symptom markers (rough idle, power loss, unusual engine noise, free-text
+vibration / jerk / noise) within 30 s of any air-path anomaly. Supporting and contradicting
+observations are both kept (e.g. "MAP stayed within +/-5 kPa during 4 episodes"). Nothing
+names an EGR valve, MAF sensor, turbocharger or intake part as faulty.
+
+**Fault codes.** DTCs come only from the existing pre/post scans (raw code, ECU, scan
+phase, stored / pending / permanent) and the MIL from PID 01; nothing is cleared.
+Manufacturer-range codes (P1xxx, P30xx-P33xx, B/C/U 1-2) are shown as the raw code: a
+description is used only if a verified mapping exists for the vehicle profile **and** a
+confirmed ECU variant (none does yet, so P115D is "description not verified"). Such a code is
+neither counted as an air-path fault nor allowed to produce "no air-path DTC" evidence. A
+code in the pre-scan is reported as set before the session; a code only in the post-scan as
+set during it, time unknown. No code is ever tied to the moment of an anomaly. Owner-reported
+BMW codes (4862, 480A) are listed separately as history from a BMW tester.
+
+**Longitudinal.** Each history row (`/api/monitoring/history`, Compare drives) carries an
+`air_path` block: zero / low MAF per 1000 running samples, episodes (count, per running hour,
+total and longest duration, persistent, repeated clusters), dips, cold / warm and idle /
+moving counts, RPM-unstable episodes, EGR excursions per running hour and max |error|,
+generic DTCs, MIL, symptom markers near an anomaly, and `vs_cohort` (medians of the *other*
+sessions of the same cohort, from 2 sessions on). `air_path_trends` gives per cohort the
+session series, medians, medians per drive-type label, pooled cold / warm / idle / moving
+rates, episodes per 10 °C coolant band, DTC recurrence and an earlier-vs-later comparison
+(from 4 sessions). Cohorts are the same as for the other references: one vehicle profile,
+real or synthetic, one confirmed identity; they are never pooled.
+
+The air-path finding (`air_path_egr_maf`, also used by `dde_4862`) now includes the MAF
+evidence, the associations (as conditions / contradicting evidence), the generic DTCs with
+their uncertainty, and the same car's earlier sessions. Zero MAF while running can make it
+`suggestive`; `strong` still requires an SAE air-path-family DTC plus signal evidence.
+
+| | Source |
+|---|---|
+| ECU measurements | MAF, RPM, speed, load, MAP, coolant, commanded EGR, EGR error values; DTC codes / status / MIL |
+| Heuristically inferred | running state, zero / low episodes, dips, excursions, cold / warm, idle / moving, associations, rates, trends |
+| Manual | symptom markers |
+| Not available without BMW diagnostics | DDE fault memory (4862, 480A), meaning of P115D for this DDE variant, MAF / EGR / boost targets, EGR valve position, air-mass adaptation values |
+
+Reference data: the first real recording (session `20261118-143936-c028`) is not in the
+repository. `fixtures/mini-monitoring-air-path.jsonl` (simulator scenario
+`mini_air_path_anomalies`) is a synthetic, anonymised stand-in reproducing its observable
+pattern: cold start ~7 -> ~73 °C, stored P115D with MIL on, short MAF 0 / < 1 g/s spells
+with the engine running, EGR-error swings both ways, an `unusual_engine_noise` marker, and
+ECU communication lost at the end without a measured engine stop.
+
 ## Dashboard (tab "MINI monitoring")
 
 - **Live**: recording state and elapsed time, link state (ECU answering / not
@@ -194,12 +279,19 @@ car's own history, not BMW / MINI limits.
   manual, blue = observed) and shaded inferred intervals; event table with origin;
   engine stops and fan durations; voltage per source; DPF observations; cooling;
   sampling quality per signal (planned vs actual Hz, gaps, link events).
+- **Session details** also has an **Air path** panel: MAF screening counts, cold / warm and
+  idle / moving distribution, episodes with raw answer and context ages, EGR-error
+  excursions, supporting / contradicting associations, fault codes with their uncertainty,
+  and the comparison with the car's other sessions. MAP and EGR-error charts were added to
+  the stack; MAF candidates are shaded.
 - **Compare drives**: per session and per drive-type label (city / highway / ...):
   engine stops, fan runs after stop and their mean duration, battery warnings,
-  possible and possibly interrupted regenerations.
+  possible and possibly interrupted regenerations, MAF low / zero per 1000 running samples,
+  MAF episodes (per hour), EGR excursions per hour, generic DTCs and MIL; below it, the
+  air-path trend per data origin with DTC recurrence.
 
-Badges everywhere: *measured*, *observed*, *manual*, *inferred - possible*, *raw only*,
-*not available*.
+Badges everywhere: *measured*, *observed*, *manual*, *inferred - possible*,
+*inferred - candidate* (air-path screening), *raw only*, *not available*.
 
 Controls are for a passenger or for stationary use. The recording needs no
 interaction while driving.
@@ -218,8 +310,9 @@ session (including ATRV samples and events) for offline analysis.
 ## Not available through this tool
 
 DPF regeneration state and request, soot mass, ash load, distance/time since the last
-regeneration, failed-regeneration counters, BMW fault memory (480A, 4862), EGR
-target/actual, fan state. Extended standard PIDs (7A/7B/7C DPF, 78/79 EGT, 73 exhaust
+regeneration, failed-regeneration counters, BMW fault memory (480A, 4862), the meaning
+of manufacturer-range generic codes such as P115D for this DDE variant, EGR
+target/actual, MAF and boost targets, fan state. Extended standard PIDs (7A/7B/7C DPF, 78/79 EGT, 73 exhaust
 pressure, 8B aftertreatment, 86 PM sensor, 69, 6B) are stored raw only if the ECU
 offers them; decoders will only be added after their byte layout has been verified
 against a real response.

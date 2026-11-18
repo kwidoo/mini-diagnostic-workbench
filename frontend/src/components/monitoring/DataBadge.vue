@@ -8,6 +8,7 @@ const KINDS: Record<string, { text: string; cls: string; title: string }> = {
   observed: { text: 'observed', cls: 'text-series-1', title: 'transition seen directly in measured data (e.g. RPM fell to 0)' },
   manual: { text: 'manual', cls: 'text-ink', title: 'marked by a person' },
   inferred: { text: 'inferred · possible', cls: 'text-warn', title: 'heuristic interpretation of indirect evidence; never confirmed' },
+  candidate: { text: 'inferred · candidate', cls: 'text-warn', title: 'screening threshold of this tool (not a manufacturer limit); not a diagnosis' },
   raw_only: { text: 'raw only', cls: 'text-ink-2', title: 'the ECU answers, but no verified decoder exists: bytes stored, no value' },
   not_available: { text: 'not available', cls: 'text-ink-2 line-through decoration-1', title: 'not offered by this ECU via generic OBD, or manufacturer-only' },
   no_valid_answer: { text: 'no valid answer', cls: 'text-crit', title: 'advertised, but every read failed' },

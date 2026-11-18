@@ -4,6 +4,7 @@ import { useWorkbench } from '../../stores/workbench'
 import type { Signal, VoltageSource } from '../../types'
 import LineChart from '../LineChart.vue'
 import { coords, timeDomain } from '../chart'
+import AirPathPanel from './AirPathPanel.vue'
 import DataBadge from './DataBadge.vue'
 import DataLegend from './DataLegend.vue'
 import EventMarkerBar from './EventMarkerBar.vue'
@@ -26,11 +27,15 @@ const sig = (hex: string): Signal | undefined => series.value?.signals.find((s) 
 const markers = computed(() =>
   (series.value?.annotations ?? []).map((a) => ({ t: a.t, label: a.event_type ?? a.label, origin: a.origin ?? 'manual' })),
 )
-const bands = computed(() =>
-  (m.value?.dpf.possible_regenerations ?? [])
+const bands = computed(() => [
+  ...(m.value?.dpf.possible_regenerations ?? [])
     .filter((r) => r.t_start_rel_s !== undefined && r.t_end_rel_s !== undefined)
     .map((r) => ({ from: r.t_start_rel_s as number, to: r.t_end_rel_s as number, label: 'possible regeneration (inferred)' })),
-)
+  // air-path candidates: low / zero MAF while running (a single sample is widened to 1 s so it stays visible)
+  ...(m.value?.air_path?.maf.episodes ?? []).map((e) => ({
+    from: e.t_start_rel_s - 0.5, to: e.t_end_rel_s + 0.5, label: e.type === 'maf_zero_while_running' ? 'MAF 0 (candidate)' : 'MAF low (candidate)',
+  })),
+])
 /** shared x range: every sample, failed read, event marker and inferred interval stays in view.
  * Iterative (no spreading of large arrays into Math.min/max): safe for very long recordings. */
 const domain = computed<[number, number] | null>(() => {
@@ -48,7 +53,9 @@ const CHARTS = [
   { hex: '0C', title: 'Engine speed' },
   { hex: '05', title: 'Coolant temperature' },
   { hex: '2C', title: 'Commanded EGR' },
+  { hex: '2D', title: 'EGR error' },
   { hex: '10', title: 'MAF' },
+  { hex: '0B', title: 'Intake manifold pressure (MAP)' },
 ]
 const wanted = computed(() => m.value?.dpf.availability.find((g) => g.group === 'wanted')?.items ?? [])
 const standard = computed(() => m.value?.dpf.availability.find((g) => g.group === 'standard_pids')?.items ?? [])
@@ -90,7 +97,7 @@ const sources = computed<[string, VoltageSource][]>(() => (m.value ? [['ECU', m.
       <section class="grid gap-2" data-test="combined-charts">
         <p class="text-xs text-ink-2">
           Shared time axis (seconds from the first sample). Dashed lines: manual markers; solid blue: observed events; shaded: inferred
-          possible regeneration. Gaps are left empty.
+          possible regeneration and air-path candidates (MAF low / 0 while running). Gaps are left empty.
         </p>
         <template v-for="c in CHARTS" :key="c.hex">
           <LineChart
@@ -113,7 +120,7 @@ const sources = computed<[string, VoltageSource][]>(() => (m.value ? [['ECU', m.
               <td>{{ t(e.t_rel_s) }}</td><td>{{ e.event_type ?? e.label }}</td><td><DataBadge :kind="e.origin" /></td><td class="text-ink-2">{{ e.note }}</td>
             </tr>
             <tr v-for="(d, i) in m.detected_events" :key="`d${i}`" class="border-t border-line" data-test="detected-row">
-              <td>{{ t(d.t_start_rel_s ?? d.t_rel_s) }}</td><td>{{ d.type }} ({{ d.confidence }} confidence)</td><td><DataBadge kind="inferred" /></td>
+              <td>{{ t(d.t_start_rel_s ?? d.t_rel_s) }}</td><td>{{ d.type }} ({{ d.confidence }} confidence)</td><td><DataBadge :kind="d.status === 'candidate' ? 'candidate' : 'inferred'" /></td>
               <td class="text-ink-2">{{ d.text }}</td>
             </tr>
           </tbody>
@@ -178,6 +185,8 @@ const sources = computed<[string, VoltageSource][]>(() => (m.value ? [['ECU', m.
           <p class="mt-1 text-xs text-ink-2">{{ m.voltage.caveat }}</p>
         </div>
       </section>
+
+      <AirPathPanel v-if="m.air_path" :ap="m.air_path" />
 
       <section class="panel text-sm" data-test="dpf-panel">
         <h2 class="h2">DPF observations</h2>

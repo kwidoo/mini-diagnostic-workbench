@@ -123,7 +123,114 @@ def render_monitoring(m: dict[str, Any]) -> list[str]:
     oc = m.get("observed_capabilities")
     if oc:
         out.append(f"- Observed in this session (not assumed): {oc}")
+    if m.get("air_path"):
+        out += render_air_path(m["air_path"])
     return out + [""]
+
+
+def render_air_path(ap: dict[str, Any]) -> list[str]:
+    """Air-path subsection of the monitoring report: statistics, evidence, limitations."""
+
+    def t(x: float | None) -> str:
+        return "n/a" if x is None else f"{x:.0f} s"
+
+    def na(x: Any) -> str:
+        return "n/a" if x is None else str(x)
+
+    out = [
+        "",
+        "### Air path (MAF / EGR / MAP / DTC)",
+        "",
+        "Measured: values decoded from ECU answers. Inferred: running state, episodes, dips, excursions, "
+        "associations and rates (screening heuristics, listed under `heuristics` in monitoring.json; not BMW / MINI "
+        "specifications). Not available: BMW DDE fault memory and MAF / EGR / boost targets.",
+        "",
+        "| Signal | Status | Samples | Failed reads |",
+        "|---|---|---|---|",
+    ]
+    for s in ap["signals"].values():
+        out.append(
+            f"| {s['name']} | {s['status'].replace('_', ' ')} | {s['samples']} | {s['failed_reads']} |"
+        )
+    maf = ap["maf"]
+    out.append("")
+    if ap["signals"]["maf"]["status"] == "measured":
+        rs = maf["running_state"]
+        out += [
+            f"- MAF samples: {maf['samples_ok']} with a value; engine confirmed running for {rs['running_confirmed']}, "
+            f"not running for {rs['engine_not_running']}, unknown for {rs['unknown']}; "
+            f"{maf['failed_reads']['n']} failed read(s) (no value, never counted as zero).",
+            f"- While running: {maf['zero_running']} sample(s) at 0.00 g/s, {maf['low_running']} below the screening "
+            f"value (per 1000 running samples: {na(maf['zero_per_1k_running'])} / {na(maf['low_per_1k_running'])}). "
+            f"Zero with the engine measured off: {maf['zero_engine_not_running']} (expected, not counted).",
+            f"- Episodes: {maf['episode_count']} ({maf['persistent_episodes']} persistent, {maf['transient_episodes']} "
+            f"single transient, {maf['repeated_clusters']} repeated cluster(s)), total {maf['episode_total_s']} s; "
+            f"abrupt dips with recovery: {len(maf['dips'])}.",
+            "- Cold / warm (coolant split at the screening value): "
+            + "; ".join(
+                f"{k}: {g['low']} low of {g['running_samples']} running samples, {g['episodes']} episode(s)"
+                for k, g in maf["by_temperature"].items()
+                if g["running_samples"] or g["episodes"]
+            ),
+            "- Idle / moving: "
+            + "; ".join(
+                f"{k}: {g['low']} low of {g['running_samples']}, {g['episodes']} episode(s)"
+                for k, g in maf["by_motion"].items()
+                if g["running_samples"] or g["episodes"]
+            ),
+        ]
+        for e in maf["episodes"][:30]:
+            ev = e["evidence"][0] if e["evidence"] else {}
+            out.append(
+                f"  - {t(e['t_start_rel_s'])}: *{e['type']}* ({e['confidence']} confidence, inferred), {e['samples']} "
+                f"sample(s) / {e['duration_s']} s, min {e['min_maf_gs']} g/s, ECU {e['ecu']}, raw answer "
+                f"`{ev.get('response')}`; {e['motion']}, {e['temperature_state']}; RPM before "
+                f"{(e['rpm']['first']['rpm_before'] or {}).get('value')} / after "
+                f"{(e['rpm']['first']['rpm_after'] or {}).get('value')}"
+            )
+        if len(maf["episodes"]) > 30:
+            out.append(f"  - ... {len(maf['episodes']) - 30} more in monitoring.json")
+    else:
+        out.append(f"- MAF: {ap['signals']['maf']['status'].replace('_', ' ')} (no statistics; not zero).")
+    egr = ap["egr_error"]
+    if egr["count"] is not None:
+        out.append(
+            f"- EGR error (2D) excursions (|error| >= {egr['screen_pct']:g} %): {egr['count']} "
+            f"({na(egr['per_running_h'])} per running hour), max |error| {na(egr['max_abs_pct'])} %; "
+            f"by motion {egr['by_motion']}, by load {egr['by_load']}."
+        )
+    corr = ap["correlations"]
+    out += ["", "**Associations (in time, not causation)**", ""]
+    out += [f"- supporting: {x}" for x in corr["supporting"]] or ["- supporting: none"]
+    out += [f"- contradicting: {x}" for x in corr["contradicting"]] or ["- contradicting: none"]
+    dt = ap["dtcs"]
+    out += ["", "**Fault codes**", ""]
+    if not dt["scans"]:
+        out.append("- No fault scan in this session: DTC status unknown.")
+    for b in dt["by_code"]:
+        desc = b["description"] or "description not verified for this ECU variant"
+        out.append(
+            f"- {b['code']} (generic OBD, ECU {', '.join(str(e) for e in b['ecus'])}, {', '.join(b['statuses'])}, "
+            f"{', '.join(b['scan_phases'])} scan): {desc}. {b['note']} Timing: {b['timing']}."
+        )
+    if dt["scans"] and not dt["codes"]:
+        out.append("- No generic DTC reported in this session's scans.")
+    out.append(f"- MIL: {'ON' if dt['mil_on'] else 'off' if dt['mil_on'] is False else 'unknown'}")
+    if dt["owner_reported_manufacturer_codes"]:
+        out.append(
+            "- Owner-reported BMW codes (not read by this tool): "
+            + ", ".join(c["code"] for c in dt["owner_reported_manufacturer_codes"])
+            + ". "
+            + dt["owner_reported_note"]
+        )
+    hist = ap.get("history")
+    if hist:
+        out += ["", "**Compared with this vehicle's other sessions**", ""]
+        out.append(
+            f"- {hist['note']} Other sessions: {hist['other_sessions']}; medians: {hist['medians'] or 'n/a'}"
+        )
+    out += ["", "**Limitations**", ""] + [f"- {x}" for x in ap["limitations"]]
+    return out
 
 
 def render_report(
@@ -294,7 +401,7 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
         meta = session["meta"]
         files["README.txt"] += (
             "\ncontinuous-monitoring files:\n"
-            "monitoring.json        full monitoring summary (shutdowns, fan runs, voltage, coolant, DPF, link)\n"
+            "monitoring.json        full monitoring summary (shutdowns, fan runs, voltage, coolant, DPF, link, air path)\n"
             "events.jsonl           every timeline event: manual, observed and link events with origin/evidence\n"
             "detected_events.json   inferred diagnostic events (always 'possible', never confirmed)\n"
             "sampling_quality.json  tiers, effective intervals, adjustments and per-signal rates\n"
