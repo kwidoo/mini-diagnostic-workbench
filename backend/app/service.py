@@ -540,6 +540,8 @@ class Workbench:
             "settings": self.dde_settings(),
             "connected": self.client is not None,
             "source": self.source,
+            # DDE-03: refusal of the manufacturer addressing, remembered for this adapter connection
+            "adapter_state": self.client.dde_adapter_state() if self.client else None,
             **cat.describe(ctx),
         }
 

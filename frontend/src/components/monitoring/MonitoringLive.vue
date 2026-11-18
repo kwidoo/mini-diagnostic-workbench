@@ -176,7 +176,7 @@ const chartPoints = (key: number) => wb.live[key]?.points ?? []
       </div>
     </section>
 
-    <DdeMonitorPanel v-if="rec && wb.profile?.ecus.some((e) => e.id.startsWith('bmw-dde'))" :live="mon?.dde ?? null" />
+    <DdeMonitorPanel v-if="rec && wb.profile?.ecus.some((e) => e.id.startsWith('bmw-dde'))" :live="mon?.dde ?? null" :link-state="mon?.state ?? null" />
 
     <section v-if="monitoringProfile && wb.plan" class="panel text-sm" data-test="dpf-live">
       <h2 class="h2">DPF data availability</h2>

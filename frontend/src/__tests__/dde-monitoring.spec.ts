@@ -1,6 +1,6 @@
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DdeMonitorPanel from '../components/monitoring/DdeMonitorPanel.vue'
 import { useWorkbench } from '../stores/workbench'
 import type { DdeMonitoringSummary, MonitorDde } from '../types'
@@ -48,5 +48,56 @@ describe('BMW DDE in monitoring (DDE-06)', () => {
     expect(w.get('[data-test=regen-confirmed]').text()).toContain('confirmed by DDE')
     expect(w.get('[data-test=regen-inferred-note]').text()).toContain('inferred from generic OBD')
     expect(w.text()).toContain('SYNTHETIC')
+  })
+})
+
+describe('live DDE freshness without new events (review fix 4)', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(1_800_000_000_000))
+  })
+  afterEach(() => vi.useRealTimers())
+
+  const now = 1_800_000_000
+  const fresh = (): MonitorDde => ({
+    ...live,
+    regeneration: { state: 'active', source: 'bmw_dde', measured_at_wall: now - 2, fresh_until_wall: now + 10, freshness_window_s: 12 },
+    signals: {
+      dpf_soot_mass: { ...live.signals.dpf_soot_mass, t_wall: now - 2, fresh_until_wall: now + 10, age_s: 2, stale: false },
+    },
+  })
+
+  it('an active flag turns unknown at its deadline and the value is marked stale, with no new snapshot', async () => {
+    const w = mount(DdeMonitorPanel, { props: { live: fresh(), linkState: 'running' } })
+    expect(w.get('[data-test=dde-regen-live]').text()).toContain('ACTIVE (confirmed by DDE)')
+    expect(w.get('[data-test=dde-sig-dpf_soot_mass]').text()).toContain('18.4 g')
+    expect(w.get('[data-test=dde-sig-dpf_soot_mass]').text()).not.toContain('stale')
+    vi.advanceTimersByTime(9_000)
+    await w.vm.$nextTick()
+    expect(w.get('[data-test=dde-regen-live]').text()).toContain('ACTIVE')
+    expect(w.get('[data-test=dde-age]').text()).toContain('11 s')
+    vi.advanceTimersByTime(3_000) // past fresh_until_wall: no new event arrived
+    await w.vm.$nextTick()
+    expect(w.get('[data-test=dde-regen-live]').text()).toContain('unknown (no fresh DDE flag)')
+    const row = w.get('[data-test=dde-sig-dpf_soot_mass]').text()
+    expect(row).toContain('(stale)')
+    expect(row).toContain('not current')
+  })
+
+  it('ECU unresponsive / adapter unreachable: unknown and not current immediately', async () => {
+    for (const state of ['ecu_unresponsive', 'adapter_unreachable']) {
+      const w = mount(DdeMonitorPanel, { props: { live: fresh(), linkState: state } })
+      expect(w.get('[data-test=dde-regen-live]').text()).toContain('unknown')
+      expect(w.get('[data-test=dde-link-paused]').text()).toContain(state)
+      expect(w.get('[data-test=dde-sig-dpf_soot_mass]').text()).toContain('not current')
+    }
+  })
+
+  it('session summaries do not depend on the live clock', async () => {
+    const w = mount(DdeMonitorPanel, { props: { summary, inferredRegenerations: 0 } })
+    vi.advanceTimersByTime(3_600_000)
+    await w.vm.$nextTick()
+    expect(w.get('[data-test=regen-confirmed]').text()).toContain('confirmed by DDE')
   })
 })

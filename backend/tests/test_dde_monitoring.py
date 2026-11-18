@@ -77,8 +77,8 @@ def test_one_session_one_timeline_everything_in_order(drive):
     assert [s["t_mono"] for s in rec] == sorted(s["t_mono"] for s in rec)  # one interleaved timeline
     types = [a.event_type for a in store.annotations(sid)]
     for needed in (
-        "engine_started", "dde_regeneration_started", "adapter_connection_lost", "adapter_connection_restored",
-        "dde_regeneration_ended", "engine_stopped", "ecu_communication_lost", "fan_running", "fan_stopped",
+        "engine_started", "dde_regeneration_started", "adapter_connection_lost", "dde_regeneration_unknown",
+        "adapter_connection_restored", "engine_stopped", "ecu_communication_lost", "fan_running", "fan_stopped",
     ):  # fmt: skip
         assert needed in types, needed
     meta = store.get_session(sid)["meta"]
@@ -89,7 +89,9 @@ def test_one_session_one_timeline_everything_in_order(drive):
         "egr_actual",
     }
     assert all(p["tier"] in ("medium", "slow") for p in meta["dde"]["plan"])  # never the fast tier
-    assert meta["monitoring"]["dde"]["restore_failures"] == 0 and t.sim.baseline()
+    # a transaction cut by the Wi-Fi outage cannot restore: fail closed (ATZ on the next connection)
+    assert meta["monitoring"]["dde"]["restore_failures"] <= len(ev(store, sid, "adapter_connection_lost"))
+    assert t.sim.baseline()
 
 
 def test_no_manufacturer_traffic_after_ecu_silence_or_during_outage(drive):
@@ -113,9 +115,13 @@ def test_regeneration_confirmed_only_by_fresh_dde_flag_and_kept_apart_from_infer
     conf = m["dpf"]["confirmed_regenerations"]
     assert len(conf) == 1 and conf[0]["source"] == "bmw_dde" and conf[0]["origin"] == "measured"
     c = conf[0]
-    # the synthetic regeneration phase runs 488..728 s; polling brackets it
-    assert 480 <= c["t_start_rel_s"] <= 560 and c["ended"] == "flag inactive" and c["ended_between_rel_s"]
-    assert c["ended_between_rel_s"][0] <= 730 <= c["ended_between_rel_s"][1] + 5
+    # the synthetic regeneration phase runs 488..728 s; the Wi-Fi outage (700..730 s) hides its end:
+    # the confirmed span stops at the last active reading before the outage, the end stays unknown
+    assert 480 <= c["t_start_rel_s"] <= 560 and c["ended"] == "unknown (adapter connection lost)"
+    assert c["t_end_rel_s"] < 700 and c["ended_between_rel_s"][1] is None
+    assert not ev(store, sid, "dde_regeneration_ended")  # no claimed end across an unknown period
+    gaps = m["dde"]["regeneration"]["unknown_gaps"]
+    assert any(g["reason"] == "adapter connection lost" and g["state_before"] == "active" for g in gaps)
     assert any(d.get("status") == "confirmed" for d in m["detected_events"])
     assert all(
         d["status"] != "confirmed" for d in m["dpf"]["possible_regenerations"]

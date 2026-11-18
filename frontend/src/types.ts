@@ -322,11 +322,17 @@ export interface DdeStatus {
 export interface MonitorDdeSignal {
   title: string | null; tier: Tier; interval_s: number; value: number | null; text: string | null; unit: string | null
   quality: string | null; detail: string | null; age_s: number | null; stale: boolean; suspended: boolean
+  /** wall time (s) of the reading and until when it counts as fresh; the panel ages it on its own clock */
+  t_wall?: number | null; fresh_until_wall?: number | null
 }
 export interface MonitorDde {
   enabled: boolean; synthetic: boolean; catalog_version: string; unsupported_adapter: string | null; scale: number
   signals: Record<string, MonitorDdeSignal>
-  regeneration: { state: 'active' | 'inactive' | 'unknown'; source: string | null }
+  regeneration: {
+    state: 'active' | 'inactive' | 'unknown'; source: string | null
+    measured_at_wall?: number | null; fresh_until_wall?: number | null; freshness_window_s?: number
+  }
+  scheduling?: { target_share: number; allowed_share: number; projected_share: number; measured_share: number; transaction_s: number | null; target_exceeded: boolean }
 }
 /** DDE-06: manufacturer section of a monitoring summary. */
 export interface DdeRegeneration {

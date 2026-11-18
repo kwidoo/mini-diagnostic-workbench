@@ -31,7 +31,7 @@ from typing import Any
 from app.models.domain import Exchange
 from app.obd.allowlist import AllowedCommand, ForbiddenRequestError
 from app.obd.client import _failure_quality, _positive, decode_exchange
-from app.obd.elm import ElmStatus, InvalidFrameError, parse_can_line, parse_reply
+from app.obd.elm import ElmStatus
 
 REPORT_FORMAT = "mini-obd-dde-capability/1"
 
@@ -88,38 +88,30 @@ def manufacturer_requests_in(exchanges: list[Exchange]) -> list[str]:
 
 
 def isotp_evidence(exchanges: list[Exchange], is_29bit: bool | None) -> list[dict[str, Any]]:
-    """Cleanly completed ISO-TP multi-frame answers (first frame + consecutive frames, the adapter
-    sending flow control) seen in the trace, per request and source ECU."""
+    """ISO-TP multi-frame answers seen in the trace: one entry per message that STARTED with a first
+    frame, with whether it completed. A single-frame reply from the same ECU in the same exchange is
+    not multi-frame evidence (it is ignored here), so an interrupted transfer followed by a
+    single-frame answer can never count as a completed multi-frame transfer."""
     out: list[dict[str, Any]] = []
     for ex in exchanges:
         if ex.status != "ok" or ex.request.startswith("AT"):
             continue
-        reply = parse_reply(bytes.fromhex(ex.response_hex), ex.request)
+        _, reply, msgs, _ = decode_exchange(ex, "can", is_29bit)
         if reply.status != ElmStatus.OK:
             continue
-        first_frames: set[str] = set()
-        for line in reply.lines:
-            try:
-                fr = parse_can_line(line, is_29bit)
-            except InvalidFrameError:
-                continue
-            if fr.data[0] >> 4 == 0x1:
-                first_frames.add(fr.ecu)
-        if not first_frames:
-            continue
-        _, _, msgs, _ = decode_exchange(ex, "can", is_29bit)
         for m in msgs:
-            if m.ecu in first_frames:
-                out.append(
-                    {
-                        "seq": ex.seq,
-                        "request": ex.request,
-                        "ecu": m.ecu,
-                        "payload_bytes": len(m.payload),
-                        "complete": m.complete,
-                        "problem": m.problem,
-                    }
-                )
+            if not m.multi_frame:
+                continue
+            out.append(
+                {
+                    "seq": ex.seq,
+                    "request": ex.request,
+                    "ecu": m.ecu,
+                    "payload_bytes": len(m.payload),
+                    "complete": m.complete,
+                    "problem": m.problem,
+                }
+            )
     return out
 
 
