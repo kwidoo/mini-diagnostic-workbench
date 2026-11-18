@@ -412,6 +412,19 @@ class Workbench:
         with self._session("snapshot", label) as (sid, client, meta):
             self._phase = "inventory"
             self._flush(client.snapshot())
+            rt = self.dde_runtime()
+            if rt is not None:
+                # DDE-05: each executable manufacturer live signal once (none for the real car today)
+                from app.manufacturer.bmw.live import DdeLiveReader
+
+                self._phase = "dde:inventory"
+                live = DdeLiveReader(rt)
+                self._flush(live.snapshot())
+                meta["dde_live"] = {
+                    "catalog_version": rt.catalog.version,
+                    "synthetic": rt.ctx.synthetic_session,
+                    "availability": live.availability(),
+                }
             self._phase = "info"
             meta["vehicle_info"] = client.vehicle_info(read_vin)
             meta["monitors"] = client.monitors()
@@ -609,6 +622,32 @@ class Workbench:
             )
             if drive_type:
                 meta["user_labels"] = {"drive_type": drive_type}
+            dde_live = None
+            dde_plan: list[dict[str, Any]] = []
+            if tiered and rp is not None and rp.monitoring and self.profile.supports_dde:
+                # DDE-06: one scheduler, one lock, one session - manufacturer items only when executable
+                from app.manufacturer.bmw.live import DdeLiveReader, monitoring_plan
+
+                rt = self.dde_runtime()
+                if rt is not None:
+                    dde_live = DdeLiveReader(rt)
+                    dde_plan = monitoring_plan(dde_live, rp.tiers)
+                    ctx = rt.ctx
+                    meta["dde"] = {
+                        "opted_in": ctx.opted_in,
+                        "confirmed_variant": ctx.confirmed_variant,
+                        "adapter_verdict": ctx.adapter_verdict,
+                        "synthetic": ctx.synthetic_session,
+                        "catalog_version": rt.catalog.version,
+                        "plan": dde_plan,
+                        "status": "polling" if dde_plan else "not_polled",
+                        "reason": None
+                        if dde_plan
+                        else "no executable manufacturer live signal (generic monitoring only); see availability",
+                        "availability": dde_live.availability(),
+                    }
+                    if not dde_plan:
+                        dde_live = None
             if tiered and rp is not None:
                 meta["sampling_plan"] = {
                     "tiers": rp.tiers.as_dict() if rp.tiers else None,
@@ -665,6 +704,7 @@ class Workbench:
                     self.store.add_scan(sid, self._with_dde_faults(client.scan_dtcs("pre", freeze_frame)))
                 self._phase = "record"
                 if tiered and rp is not None and rp.tiers is not None:
+                    self._phase = "record"
                     monitor = MonitoringRecorder(
                         client,
                         plan,
@@ -678,6 +718,8 @@ class Workbench:
                         on_state,
                         resume_probe_s=resume_probe_s,
                         primary_ecu=client.capabilities.primary_ecu if client.capabilities else None,
+                        dde_live=dde_live,
+                        dde_plan=dde_plan,
                     )
                     monitor.run()
                 else:

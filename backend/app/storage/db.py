@@ -78,6 +78,18 @@ _ANNOTATION_EXTRA = {
 }
 
 
+#: sample provenance columns added for manufacturer readings (DDE-05). NULL on every older row and on
+#: generic OBD / adapter samples; returned by samples() only when set, so older exports stay identical.
+_SAMPLE_EXTRA = {
+    "source": "TEXT",  # bmw_dde (NULL: generic OBD, or adapter for mode 0)
+    "signal_key": "TEXT",  # stable manufacturer signal key, e.g. dpf_soot_mass
+    "request_id": "TEXT",
+    "decoder_version": "TEXT",
+    "catalog_version": "TEXT",
+    "status_json": "TEXT",  # decoded status semantics (verified layouts only)
+}
+
+
 def new_session_id(t_wall: float | None = None) -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime(t_wall or time.time())) + "-" + secrets.token_hex(2)
 
@@ -103,6 +115,10 @@ class Store:
             for name, ddl in _ANNOTATION_EXTRA.items():
                 if name not in cols:
                     self._db.execute(f"ALTER TABLE annotations ADD COLUMN {name} {ddl}")
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(samples)").fetchall()}
+            for name, ddl in _SAMPLE_EXTRA.items():
+                if name not in cols:
+                    self._db.execute(f"ALTER TABLE samples ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -208,10 +224,22 @@ class Store:
     def add_samples(self, sid: str, readings: list[Reading]) -> None:
         if not readings:
             return
+        cols = (*_SAMPLE_COLS, *_SAMPLE_EXTRA)
+
+        def extra(r: Reading) -> tuple:
+            return (
+                r.source,
+                r.signal_key,
+                r.request_id,
+                r.decoder_version,
+                r.catalog_version,
+                json.dumps(r.status, sort_keys=True) if r.status is not None else None,
+            )
+
         with self.tx() as db:
             db.executemany(
-                f"INSERT INTO samples(session_id,{','.join(_SAMPLE_COLS)}) VALUES(?{',?' * len(_SAMPLE_COLS)})",
-                [(sid, *(getattr(r, c) for c in _SAMPLE_COLS)) for r in readings],
+                f"INSERT INTO samples(session_id,{','.join(cols)}) VALUES(?{',?' * len(cols)})",
+                [(sid, *(getattr(r, c) for c in _SAMPLE_COLS), *extra(r)) for r in readings],
             )
 
     def add_scan(self, sid: str, scan: DtcScan) -> None:
@@ -241,9 +269,17 @@ class Store:
 
     # -- reads -----------------------------------------------------------------
     def samples(self, sid: str) -> list[dict[str, Any]]:
-        return self._rows(
-            f"SELECT {','.join(_SAMPLE_COLS)} FROM samples WHERE session_id=? ORDER BY id", (sid,)
+        """Stored readings in insertion order. Provenance columns (DDE-05) appear only on rows that
+        have them, so generic-only sessions keep exactly their original shape."""
+        rows = self._rows(
+            f"SELECT {','.join((*_SAMPLE_COLS, *_SAMPLE_EXTRA))} FROM samples WHERE session_id=? ORDER BY id",
+            (sid,),
         )
+        for r in rows:
+            for k in _SAMPLE_EXTRA:
+                if r[k] is None:
+                    del r[k]
+        return rows
 
     def exchanges(self, sid: str) -> list[dict[str, Any]]:
         return self._rows(

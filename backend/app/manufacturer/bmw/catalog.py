@@ -132,6 +132,10 @@ class CatalogEntry:
     blocked_reason: str = ""
     establish_by: tuple[str, ...] = ()
     sample_interval_s: float | None = None  # suggested polling interval for live values (DDE-06)
+    #: what a decoded value MEANS when that is documented, e.g. "regeneration_active_flag": the decoded
+    #: status {"active": bool} is the ECU's own regeneration-active flag. Only such an entry may confirm
+    #: a regeneration (DDE-06); a value without documented semantics is never interpreted that way.
+    semantics: str | None = None
 
     @property
     def complete(self) -> bool:

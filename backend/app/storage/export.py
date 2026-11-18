@@ -42,14 +42,26 @@ def _iso(t: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t)) if t else "n/a"
 
 
+#: appended only when a session has manufacturer readings (DDE-05)
+PROVENANCE_COLUMNS = [
+    "source",
+    "signal_key",
+    "request_id",
+    "decoder_version",
+    "catalog_version",
+    "status_json",
+]
+
+
 def samples_csv(samples: list[dict[str, Any]]) -> str:
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(SAMPLE_COLUMNS)
+    cols = SAMPLE_COLUMNS + (PROVENANCE_COLUMNS if any("source" in s for s in samples) else [])
+    w.writerow(cols)
     t0 = min((s["t_mono"] for s in samples), default=0.0)
     for s in samples:
         row = dict(s, t_rel_s=round(s["t_mono"] - t0, 4), pid=f"{s['pid']:02X}")
-        w.writerow(["" if row[c] is None else row[c] for c in SAMPLE_COLUMNS])
+        w.writerow(["" if row.get(c) is None else row[c] for c in cols])
     return buf.getvalue()
 
 
@@ -125,7 +137,48 @@ def render_monitoring(m: dict[str, Any]) -> list[str]:
         out.append(f"- Observed in this session (not assumed): {oc}")
     if m.get("air_path"):
         out += render_air_path(m["air_path"])
+    if m.get("dde") and m["dde"].get("status") != "not_recorded":
+        out += render_dde(m["dde"])
     return out + [""]
+
+
+def render_dde(d: dict[str, Any]) -> list[str]:
+    """DDE-06 subsection: manufacturer values with provenance, confirmed vs inferred regeneration."""
+    tag = " - SYNTHETIC simulator data" if d.get("synthetic") else ""
+    out = [
+        "",
+        f"### BMW DDE manufacturer values{tag}",
+        "",
+        f"- Status: {d['status']}"
+        + (f" ({d['reason']})" if d.get("reason") else "")
+        + f"; catalog {d.get('catalog_version')}; opt-in {d.get('opted_in')}; variant {d.get('confirmed_variant') or '-'}; "
+        f"adapter verdict {d.get('adapter_verdict') or 'n/a'}",
+    ]
+    if d["signals"]:
+        out += [
+            "",
+            "| Signal | Source | Status | ok | failed | min / median / max | unit |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for x in d["signals"]:
+            st = x["stats"] or {}
+            out.append(
+                f"| {x['title']} (`{x['signal_key']}`) | {x['provenance']} | {x['status']} | {x['samples_ok']} | "
+                f"{x['failed'] or '-'} | {st.get('min', '-')} / {st.get('median', '-')} / {st.get('max', '-')} | "
+                f"{x['unit'] or '-'} |"
+            )
+    rg = d["regeneration"]
+    out += ["", f"- Regeneration flag: {rg['status'].replace('_', ' ')}"]
+    for e in rg["confirmed"]:
+        out.append(f"  - **confirmed by DDE**: {e['text']}")
+    for g in rg["unknown_gaps"]:
+        out.append(f"  - unknown for {g['gap_s']} s (no fresh flag reading)")
+    for k, v in d["commanded_vs_actual"].items():
+        out.append(
+            f"- {k}: commanded - actual mean {v['mean_delta']}, max |delta| {v['max_abs_delta']} ({v['pairs']} pairs)"
+        )
+    out += [f"- {x}" for x in d["limitations"]]
+    return out
 
 
 def render_air_path(ap: dict[str, Any]) -> list[str]:
@@ -486,6 +539,11 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
             "capabilities.json      adapter, ECU capabilities, requested/unsupported signals\n"
             "vehicle_profile.json   the vehicle profile the session was recorded with\n"
         )
+        if monitoring.get("dde", {}).get("status") not in (None, "not_recorded"):
+            files["README.txt"] += (
+                "dde_monitoring.json    BMW DDE plan, per-signal provenance / quality, confirmed regenerations\n"
+            )
+            files["dde_monitoring.json"] = dump(monitoring["dde"])
         files.update(
             {
                 "monitoring.json": dump(monitoring),

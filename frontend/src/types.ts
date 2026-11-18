@@ -22,6 +22,8 @@ export interface MonitorState {
   adapter_link?: 'ok' | 'lost'
   /** an explicit resume re-initialises the adapter first (ATZ ... 0100) */
   resume_requires_reinit?: boolean
+  /** DDE-06: manufacturer reads in this recording (null: none polled) */
+  dde?: MonitorDde | null
 }
 export type Tier = 'fast' | 'medium' | 'slow'
 export interface TierIntervals { fast: number; medium: number; slow: number }
@@ -70,6 +72,9 @@ export interface VehicleRecord { confirmed: Record<string, string>; owner_report
 export interface Reading {
   mode: number; pid: number; ecu: string | null; name: string; unit: string | null; value: number | null
   text: string | null; raw_hex: string; quality: string; detail: string | null; t_wall: number; t_mono: number; latency_ms: number
+  /** DDE-05 provenance: present only on manufacturer readings (mode 0x100) */
+  source?: string; signal_key?: string; request_id?: string; decoder_version?: string; catalog_version?: string
+  status_json?: string
 }
 export interface Dtc { code: string; raw_hex: string; kind: string; ecu: string | null }
 export interface FreezeFrame { status: string; dtc: string | null; dtc_raw_hex: string | null; ecu: string | null; readings: Reading[] }
@@ -182,8 +187,11 @@ export interface MonitoringSummary {
   dpf: {
     availability: { group: 'wanted' | 'standard_pids' | 'manufacturer'; items: { key?: string; hex?: string; name: string; status: DataStatus; via?: string; reason?: string; samples?: number }[] }[]
     possible_regenerations: DetectedEvent[]; possible_interrupted_regenerations: DetectedEvent[]
-    user_suspected: { t_rel_s: number; note: string; origin: Origin }[]; limitations: string[]; confirmed_regenerations: never[]
+    user_suspected: { t_rel_s: number; note: string; origin: Origin }[]; limitations: string[]
+    /** only from a fresh, decoded DDE regeneration flag (DDE-06); empty otherwise */
+    confirmed_regenerations: DdeRegeneration[]
   }
+  dde?: DdeMonitoringSummary
   detected_events: DetectedEvent[]
   events: { t_rel_s: number; label: string; event_type: string | null; origin: Origin; confidence: string | null; note: string }[]
   link: { type: string; t_rel_s: number; gap_s: number | null; note: string }[]
@@ -308,4 +316,31 @@ export interface DdeStatus {
   connected?: boolean; source?: string; version?: string; synthetic?: boolean
   context?: { opted_in: boolean; confirmed_variant: string | null; adapter_verdict: string | null; synthetic_session: boolean }
   availability?: DdeAvailability[]
+}
+
+/** DDE-06: live manufacturer state of a running monitoring recording (MonitorState.dde). */
+export interface MonitorDdeSignal {
+  title: string | null; tier: Tier; interval_s: number; value: number | null; text: string | null; unit: string | null
+  quality: string | null; detail: string | null; age_s: number | null; stale: boolean; suspended: boolean
+}
+export interface MonitorDde {
+  enabled: boolean; synthetic: boolean; catalog_version: string; unsupported_adapter: string | null; scale: number
+  signals: Record<string, MonitorDdeSignal>
+  regeneration: { state: 'active' | 'inactive' | 'unknown'; source: string | null }
+}
+/** DDE-06: manufacturer section of a monitoring summary. */
+export interface DdeRegeneration {
+  type: string; origin: string; status: string; source: string; t_start_rel_s: number | null; t_end_rel_s: number | null
+  duration_s: number; samples: number; ended: string; synthetic: boolean; text: string; ended_between_rel_s?: (number | null)[]
+}
+export interface DdeMonitoringSummary {
+  status: string; reason?: string | null; synthetic?: boolean; catalog_version?: string | null; opted_in?: boolean | null
+  confirmed_variant?: string | null; adapter_verdict?: string | null
+  signals?: {
+    signal_key: string; title: string; provenance: string; unit: string | null; tier: string | null; samples_ok: number
+    failed: Record<string, number>; status: string; stats: { n: number; min: number; max: number; median: number; first: number; last: number } | null
+  }[]
+  regeneration?: { signal_key: string | null; confirmed: DdeRegeneration[]; unknown_gaps: { from_rel_s: number | null; to_rel_s: number | null; gap_s: number }[]; status: string }
+  commanded_vs_actual?: Record<string, { pairs: number; mean_delta: number; mean_abs_delta: number; max_abs_delta: number; note: string }>
+  limitations?: string[]
 }
