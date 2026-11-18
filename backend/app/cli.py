@@ -20,7 +20,7 @@ from app.obd.client import ObdError
 from app.parameters.standard_pids import PIDS, RAW_ONLY_PIDS, pid_name
 from app.service import BusyError, NotConnectedError, Workbench
 from app.storage.db import Store
-from app.storage.export import build_files, build_zip
+from app.storage.export import build_files, build_zip, render_dde_faults
 from app.storage.transcript import ingest_file
 from app.vehicles.profiles import MONITORING_EVENT_IDS, PROFILES
 
@@ -231,6 +231,8 @@ def _print_scans(store: Store, sid: str) -> None:
             for r in ff.readings:
                 if r.value is not None:
                     print(f"    {r.name}: {r.value} {r.unit or ''}")
+        for line in render_dde_faults(sc):
+            print("  " + line.replace("**", ""))
 
 
 def _print_findings(findings) -> None:

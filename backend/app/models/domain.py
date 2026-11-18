@@ -92,15 +92,64 @@ class Dtc(BaseModel):
     ecu: str | None = None
 
 
+ManufacturerFaultStatus = Literal[
+    "not_attempted",  # nothing was sent (no gate pass, no connection, link not initialised)
+    "unavailable",  # no executable fault-memory entry for this car / adapter / opt-in
+    "unsupported_adapter",  # the adapter cannot provide the documented addressing
+    "read",  # complete, successful read with at least one fault
+    "no_faults",  # complete, successful read that listed no fault ("no faults found")
+    "partial",  # positive answer whose layout did not fully decode: codes kept, completeness unknown
+    "negative",  # the ECU answered with a negative response (NRC kept)
+    "no_data",
+    "timeout",
+    "disconnected",
+    "error",
+]
+
+
+class ManufacturerFault(BaseModel):
+    """One manufacturer fault-memory record exactly as returned. ``status`` is only filled from a
+    verified (or, in the simulator, synthetic) layout; otherwise just ``status_raw``."""
+
+    code: str  # manufacturer code exactly as returned (hex), e.g. "4862" - never mapped to a P-code
+    raw_hex: str
+    status_raw: str | None = None
+    status: dict[str, Any] | None = None
+    counter: int | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManufacturerFaultRead(BaseModel):
+    origin: Literal["bmw_dde"] = "bmw_dde"
+    status: ManufacturerFaultStatus
+    detail: str | None = None
+    synthetic: bool = False
+    request_id: str | None = None
+    catalog_version: str | None = None
+    decoder_id: str | None = None
+    decoder_version: str | None = None
+    ecu: str | None = None
+    raw_hex: str = ""
+    nrc: str | None = None
+    t_wall: float | None = None
+    exchange_seqs: list[int] = Field(default_factory=list)
+    faults: list[ManufacturerFault] = Field(default_factory=list)
+
+
 class DtcScan(BaseModel):
     t_wall: float
     phase: str = "scan"  # scan | pre | post
+    #: origin of ``dtcs`` / ``mode_status`` / ``freeze_frame``; older stored scans default to generic
+    origin: Literal["generic_obd"] = "generic_obd"
     dtcs: list[Dtc] = Field(default_factory=list)
     # kind -> "supported" | "no_data" | "error" ; never silently empty
     mode_status: dict[str, str] = Field(default_factory=dict)
     mil_on: bool | None = None
     dtc_count_reported: int | None = None
     freeze_frame: FreezeFrame | None = None
+    #: BMW DDE fault memory read at the same time (DDE-04). None: not part of this scan (older
+    #: sessions, other vehicle profiles). Kept separate: never merged into ``dtcs``.
+    manufacturer: ManufacturerFaultRead | None = None
 
 
 class FreezeFrame(BaseModel):

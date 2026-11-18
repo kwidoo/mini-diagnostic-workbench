@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.manufacturer.bmw.decoders import DECODERS, DecodedValue, DecodeError
+from app.manufacturer.bmw.decoders import DECODERS, FAULT_DECODERS, DecodedValue, DecodeError
 
 CATALOG_VERSION = "dde-catalog/2026-11-18.1"
 
@@ -301,7 +301,8 @@ class RequestCatalog:
             if rivals:
                 r.append(f"ambiguous: {', '.join(rivals)} also claim this metric for the same variant")
         if e.response is not None:
-            dec = DECODERS.get(e.response.decoder_id)
+            registry = FAULT_DECODERS if e.kind == "fault_memory" else DECODERS
+            dec = registry.get(e.response.decoder_id)
             if dec is None:
                 r.append(f"decoder {e.response.decoder_id!r} is not registered")
             elif dec.version != e.response.decoder_version:

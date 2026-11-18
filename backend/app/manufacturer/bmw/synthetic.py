@@ -17,7 +17,16 @@ from app.manufacturer.bmw.catalog import (
     ResponseLayout,
     Source,
 )
-from app.manufacturer.bmw.decoders import DecodedValue, DecodeError, Decoder, register, unsigned_be
+from app.manufacturer.bmw.decoders import (
+    DecodedValue,
+    DecodeError,
+    Decoder,
+    FaultDecoder,
+    FaultRecord,
+    register,
+    register_fault,
+    unsigned_be,
+)
 
 SYNTHETIC_VARIANT = "SYNTHETIC-DDE-0"
 SYNTHETIC_CATALOG_VERSION = "dde-catalog/synthetic-1"
@@ -124,7 +133,58 @@ SYN_IDENT = CatalogEntry(
     evidence=("synthetic: served by the fake ELM327",),
 )
 
+
+def _fault_list(payload: bytes) -> tuple[list[FaultRecord], bool]:
+    """SYNTHETIC layout: 58 <count> then <code hi> <code lo> <status> per fault.
+    Status bits (invented): 0x01 present now, 0x04 intermittent, 0x08 stored, 0x20 warning lamp."""
+    if len(payload) < 2:
+        raise DecodeError("fault list shorter than SID + count")
+    count, body = payload[1], payload[2:]
+    out = []
+    for i in range(0, len(body) - len(body) % 3, 3):
+        code, st = body[i : i + 2], body[i + 2]
+        out.append(
+            FaultRecord(
+                code=code.hex().upper(),
+                raw_hex=body[i : i + 3].hex().upper(),
+                status_raw=f"{st:02X}",
+                status={
+                    "present": bool(st & 0x01),
+                    "intermittent": bool(st & 0x04),
+                    "stored": bool(st & 0x08),
+                    "warning_lamp": bool(st & 0x20),
+                },
+            )
+        )
+    complete = len(body) % 3 == 0 and len(out) == count
+    return out, complete
+
+
+SYN_FAULT_DECODER = register_fault(
+    FaultDecoder("synthetic.fault_list", "1", _fault_list, True, "58 count (code2 status1)*")
+)
+
+SYN_FAULTS = CatalogEntry(
+    request_id="syn.fault_memory",
+    metric="dde_fault_memory",
+    title="SYNTHETIC DDE fault memory",
+    priority="P0",
+    kind="fault_memory",
+    verification_state="fixture_verified",
+    risk_class="pure_read",
+    source_ids=("synthetic_simulator",),
+    compatible_variants=(SYNTHETIC_VARIANT,),
+    service=0x18,
+    payload_hex="1802FFFF",
+    addressing=SYN_ADDR,
+    response=ResponseLayout(0x58, "", 2, 255, "synthetic.fault_list", "1"),
+    enabled=True,
+    synthetic=True,
+    evidence=("synthetic: served by the fake ELM327",),
+)
+
 SYN_ENTRIES: tuple[CatalogEntry, ...] = (
+    SYN_FAULTS,
     SYN_IDENT,
     *(_entry(m, *spec) for m, spec in SYN_LIVE.items()),
 )

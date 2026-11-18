@@ -58,3 +58,37 @@ def unsigned_be(data: bytes, nbytes: int, scale: float, offset: float, unit: str
         raise DecodeError(f"expected {nbytes} data bytes, got {len(data)}")
     raw = int.from_bytes(data[:nbytes], "big")
     return DecodedValue(quality="ok", value=round(raw * scale + offset, 4), unit=unit)
+
+
+# -- fault-memory list decoders (DDE-04) ----------------------------------------------------
+
+
+@dataclass
+class FaultRecord:
+    code: str
+    raw_hex: str
+    status_raw: str | None = None
+    status: dict[str, Any] | None = None
+    counter: int | None = None
+
+
+@dataclass(frozen=True)
+class FaultDecoder:
+    """Positive fault-memory payload (SID first) -> (records, complete). ``complete`` is True only
+    when the layout accounted for every byte (declared count == records, no trailing bytes)."""
+
+    id: str
+    version: str
+    fn: Callable[[bytes], tuple[list[FaultRecord], bool]]
+    synthetic: bool = False
+    description: str = ""
+
+
+FAULT_DECODERS: dict[str, FaultDecoder] = {}
+
+
+def register_fault(dec: FaultDecoder) -> FaultDecoder:
+    if dec.id in FAULT_DECODERS and FAULT_DECODERS[dec.id] != dec:
+        raise ValueError(f"fault decoder {dec.id} already registered with a different definition")
+    FAULT_DECODERS[dec.id] = dec
+    return dec

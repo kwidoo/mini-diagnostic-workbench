@@ -233,6 +233,69 @@ def render_air_path(ap: dict[str, Any]) -> list[str]:
     return out
 
 
+def render_dde_faults(sc: Any) -> list[str]:
+    """DDE-04 lines for one scan: measured BMW DDE fault memory, kept apart from generic DTCs."""
+    m = getattr(sc, "manufacturer", None)
+    if m is None:
+        return []
+    tag = " [SYNTHETIC]" if m.synthetic else ""
+    head = f"- BMW DDE fault memory{tag}: **{m.status.replace('_', ' ')}**"
+    if m.status in ("read", "partial", "no_faults"):
+        head += f" (ECU {m.ecu}, {m.request_id}, catalog {m.catalog_version}, decoder {m.decoder_version})"
+    elif m.detail:
+        head += f" - {m.detail}"
+    lines = [head]
+    lines += [
+        f"  - {f.code} (manufacturer code as returned, raw {f.raw_hex}, status byte {f.status_raw}"
+        + (
+            f": {', '.join(k for k, v in (f.status or {}).items() if v) or 'no status bit set'}"
+            if f.status
+            else ""
+        )
+        + ")"
+        for f in m.faults
+    ]
+    return lines
+
+
+def dde_faults_csv(scans: list) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(
+        ["scan_phase", "scan_t_wall", "read_status", "synthetic", "code", "raw_hex", "status_raw", "status",
+         "ecu", "request_id", "catalog_version", "decoder_version", "detail"]
+    )  # fmt: skip
+    for sc in scans:
+        m = sc.manufacturer
+        if m is None:
+            continue
+        common = [
+            m.ecu or "",
+            m.request_id or "",
+            m.catalog_version or "",
+            m.decoder_version or "",
+            m.detail or "",
+        ]
+        if not m.faults:
+            w.writerow([sc.phase, sc.t_wall, m.status, m.synthetic, "", "", "", "", *common])
+        for f in m.faults:
+            st = json.dumps(f.status, sort_keys=True) if f.status else ""
+            w.writerow(
+                [
+                    sc.phase,
+                    sc.t_wall,
+                    m.status,
+                    m.synthetic,
+                    f.code,
+                    f.raw_hex,
+                    f.status_raw or "",
+                    st,
+                    *common,
+                ]
+            )
+    return buf.getvalue()
+
+
 def render_report(
     session: dict[str, Any],
     scans: list,
@@ -302,6 +365,7 @@ def render_report(
             out += [
                 f"  - {r.name}: {r.value} {r.unit or ''}".rstrip() for r in ff.readings if r.value is not None
             ]
+        out += render_dde_faults(sc)
         out += [""]
     metrics = meta.get("metrics") or []
     if metrics:
@@ -446,6 +510,16 @@ def build_files(store: Store, sid: str, include_vin: bool = False) -> dict[str, 
                 "vehicle_profile.json": dump(prof.to_dict()),
             }
         )
+    # the CSV only when a read was actually attempted; "unavailable" is still in dtcs.json / report.md
+    if any(
+        sc.manufacturer is not None and sc.manufacturer.status not in ("unavailable", "not_attempted")
+        for sc in scans
+    ):
+        files["README.txt"] += (
+            "\nBMW DDE fault memory (kept separate from generic DTCs; codes exactly as returned):\n"
+            "dde_faults.csv         one row per manufacturer fault, or one status row per read attempt\n"
+        )
+        files["dde_faults.csv"] = dde_faults_csv(scans)
     cap = session["meta"].get("dde_capability")
     if cap:
         from app.manufacturer.bmw.capability import render_markdown

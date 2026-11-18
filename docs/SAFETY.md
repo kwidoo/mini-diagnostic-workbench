@@ -34,6 +34,12 @@ name), plus 02 (VIN) with explicit consent. It adds no request type and no adapt
 command. The report counts any request outside the allowlist found in the session
 trace (must be 0). Details: DDE_CAPABILITY.md.
 
+## BMW DDE fault memory (DDE-04)
+
+Read only with a scan or the pre / post scans of a recording, through the guarded DDE path,
+and only when a verified catalog entry passes every gate. Today none does, so nothing is
+sent and the scan records `unavailable`. Nothing is ever cleared. See DDE_FAULTS.md.
+
 ## Continuous monitoring
 
 - No new request type: monitoring uses the same allowlisted generic OBD reads plus the

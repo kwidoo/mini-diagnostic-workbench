@@ -73,9 +73,23 @@ export interface Reading {
 }
 export interface Dtc { code: string; raw_hex: string; kind: string; ecu: string | null }
 export interface FreezeFrame { status: string; dtc: string | null; dtc_raw_hex: string | null; ecu: string | null; readings: Reading[] }
+/** DDE-04: BMW DDE fault memory read with a scan; kept apart from the generic codes. */
+export interface ManufacturerFault {
+  code: string; raw_hex: string; status_raw: string | null; status: Record<string, boolean> | null; counter: number | null
+}
+export interface ManufacturerFaultRead {
+  origin: 'bmw_dde'
+  status: 'not_attempted' | 'unavailable' | 'unsupported_adapter' | 'read' | 'no_faults' | 'partial' | 'negative'
+    | 'no_data' | 'timeout' | 'disconnected' | 'error'
+  detail: string | null; synthetic: boolean; request_id: string | null; catalog_version: string | null
+  decoder_version: string | null; ecu: string | null; raw_hex: string; nrc: string | null; faults: ManufacturerFault[]
+}
 export interface DtcScan {
   t_wall: number; phase: string; dtcs: Dtc[]; mode_status: Record<string, string>
   mil_on: boolean | null; dtc_count_reported: number | null; freeze_frame: FreezeFrame | null
+  origin?: 'generic_obd'
+  /** absent / null on older scans and other vehicles */
+  manufacturer?: ManufacturerFaultRead | null
 }
 export interface Metric {
   pid: number; name: string; attempts: number; ok: number; dropped: number; error_rate: number; actual_hz: number
