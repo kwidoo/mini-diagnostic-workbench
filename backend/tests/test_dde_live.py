@@ -98,7 +98,10 @@ def test_disabled_dde_sends_nothing_and_keeps_inventory_generic(store):
     sid = wb.inventory()
     assert not any("source" in r for r in store.samples(sid))
     assert not any(c.startswith("ATSH") for c in wb.transport.sim.received)
-    assert {m["status"] for m in store.get_session(sid)["meta"]["dde_live"]["availability"]} == {"blocked", "unavailable"}
+    assert {m["status"] for m in store.get_session(sid)["meta"]["dde_live"]["availability"]} == {
+        "blocked",
+        "unavailable",
+    }
 
 
 def test_exports_and_replay_keep_provenance(store):

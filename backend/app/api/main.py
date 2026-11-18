@@ -128,6 +128,32 @@ def _series(store: Store, sid: str) -> dict[str, Any]:
             return round(a.t_mono - t0, 3)
         return round(a.t_wall - wall0, 3) if wall0 is not None else None  # marked after the recording
 
+    # DDE-06: manufacturer signals are their own series (provenance bmw_dde), keyed by their stable pid
+    for s in all_rows:
+        if s.get("source") != "bmw_dde":
+            continue
+        sig = signals.setdefault(
+            s["pid"],
+            {
+                "pid": s["pid"],
+                "hex": s["signal_key"],
+                "name": s["name"],
+                "unit": s["unit"],
+                "decoded": True,
+                "provenance": "bmw_dde",
+                "signal_key": s["signal_key"],
+                "points": [],
+                "failed": [],
+            },
+        )
+        if sig["unit"] is None and s["unit"]:
+            sig["unit"] = s["unit"]
+        t = round(s["t_mono"] - t0, 3)
+        if s["quality"] == "ok" and s["value"] is not None:
+            sig["points"].append([t, s["value"]])
+        elif s["quality"] not in GOOD:
+            sig["failed"].append([t, s["quality"]])
+
     ann = [{"t": rel(a), **a.model_dump()} for a in store.annotations(sid)]
     return {
         "session_id": sid,

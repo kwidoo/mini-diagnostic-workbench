@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from app.adapters.base import Transport, VirtualClock
+from app.adapters.base import Transport, TransportError, VirtualClock
 from app.parameters.standard_pids import BITMAP_PIDS, encode_dtc
 
 SYNTHETIC_VIN = "SYNTHETICVIN00001"
@@ -105,6 +105,9 @@ class Scenario:
     adapter_description: str = "SYNTHETIC ELM327 SIMULATOR"
     # synthetic manufacturer-addressed ECU; None: the adapter rejects addressing commands with '?'
     dde: SimDde | None = None
+    # (t_from, t_to) windows of a simulated Wi-Fi outage (in-process transport only): the adapter
+    # connection drops and cannot be re-opened until the window ends
+    link_drops: tuple[tuple[float, float], ...] = ()
 
 
 # -- synthetic signal generators ------------------------------------------------
@@ -377,6 +380,14 @@ def _syn_dde(cycle: DriveCycle, faults: tuple[tuple[str, int], ...] = ()) -> Sim
     return SimDde("7B0", "7B8", _dde_responses(cycle, faults), tx_ext="5A", rx_ext="F5")
 
 
+# DDE-06 combined synthetic drive (~23 min): warm-up idle, city, idle, regeneration-like phase,
+# city with a Wi-Fi outage, idle, engine stop, ECU silence.
+DDE_DRIVE = DriveCycle(
+    (("ign", 8), ("idle", 60), ("city", 300), ("idle", 120), ("regen", 240), ("city", 300), ("idle", 30),
+     ("ign", 30), ("off", 300)),
+    coolant_start_c=20.0,
+)  # fmt: skip
+
 MINI = "mini-countryman-r60-diesel"
 PORSCHE = "porsche-boxster-986-mk2"
 
@@ -440,6 +451,13 @@ SCENARIOS: dict[str, Scenario] = {
             "(invented ids / layouts; exercises the gated DDE path only)",
             MINI, stored=("P115D",), mil=True, raw_only_pids=(0x7A, 0x7C, 0x78),
             dde=_syn_dde(REGEN, (("4862", 0x24), ("480A", 0x08))), **_drive(REGEN),
+        ),
+        Scenario(
+            "mini_dde_drive",
+            "Synthetic ~23 min drive with a SYNTHETIC manufacturer ECU: regeneration-like phase, Wi-Fi outage, "
+            "engine stop and ECU silence (invented ids / layouts)",
+            MINI, stored=("P115D",), mil=True, raw_only_pids=(0x7A, 0x7C, 0x78),
+            dde=_syn_dde(DDE_DRIVE, (("4862", 0x24),)), link_drops=((700.0, 730.0),), **_drive(DDE_DRIVE),
         ),
         Scenario(
             "porsche_healthy_idle", "Synthetic petrol flat-six idle over K-line (ISO 9141-2)", PORSCHE,
@@ -761,7 +779,14 @@ class SimulatorTransport(Transport):
         sc = SCENARIOS[scenario] if isinstance(scenario, str) else scenario
         self.sim = ElmSimulator(sc, clock=self.clock, seed=seed)
 
+    def _in_drop(self) -> bool:
+        t = self.sim._t()
+        return any(a <= t < b for a, b in self.sim.scenario.link_drops)
+
     def connect(self) -> None:
+        if self._in_drop():
+            self.state = "disconnected"
+            raise TransportError("simulated Wi-Fi outage: adapter not reachable")
         self.state = "connected"
         self.generation += 1
         self._opened = self.clock.monotonic()
@@ -777,6 +802,10 @@ class SimulatorTransport(Transport):
         self.state = "disconnected"  # next _ensure_connected() is a fresh "connection"
 
     def _roundtrip(self, wire: bytes, timeout_s: float) -> tuple[bytes, str]:
+        if self._in_drop():
+            self.clock.sleep(0.05)
+            self.state = "disconnected"
+            return b"", "closed"
         raw, delay = self.sim.handle(wire.decode("ascii").rstrip("\r"))
         drop = self.sim.scenario.drop_after_s
         if drop is not None and self.clock.monotonic() - self._opened > drop:

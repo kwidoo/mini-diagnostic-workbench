@@ -356,6 +356,19 @@ def _print_monitoring(m: dict) -> None:
         print(f"limitation: {line}")
     for e in m["link"]:
         print(f"link {t(e['t_rel_s'])}: {e['type']}")
+    d = m.get("dde") or {}
+    if d.get("status") not in (None, "not_recorded"):
+        print(
+            f"BMW DDE{' [SYNTHETIC]' if d.get('synthetic') else ''}: {d['status']}"
+            + (f" ({d['reason']})" if d.get("reason") else "")
+        )
+        for x in d["signals"]:
+            st = x["stats"] or {}
+            print(
+                f"  {x['signal_key']:<30}{x['status']:<10}ok {x['samples_ok']:<5} last {st.get('last', '-')} {x['unit'] or ''}"
+            )
+        for e in d["regeneration"]["confirmed"]:
+            print(f"  regeneration CONFIRMED by DDE at {t(e['t_start_rel_s'])}: {e['duration_s']:.0f} s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -546,7 +559,9 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
                 why = "" if m["status"] == "executable" else f" - {(m['reasons'] or [''])[0][:80]}"
                 print(f"  - {m['title'] or m['metric']}: {m['status']}{why}")
         else:
-            print("\nmanufacturer-specific parameters: UNAVAILABLE through this tool (see: mini-obd dde-settings)")
+            print(
+                "\nmanufacturer-specific parameters: UNAVAILABLE through this tool (see: mini-obd dde-settings)"
+            )
             for ext in wb.registry.status(wb.profile.ecu_ids):
                 for prm in ext["parameters"]:
                     print(f"  - {prm['name']}: {prm['status']}")

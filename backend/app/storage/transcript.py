@@ -36,6 +36,7 @@ RECORDING_META_KEYS = (
     "monitoring",
     "post_scan_skipped",
     "aborted",
+    "dde",
 )
 REDACTED = "[REDACTED]"
 
@@ -123,7 +124,8 @@ def ingest_transcript(
         try:
             cmd = AllowedCommand.parse(ex.request)
         except ForbiddenRequestError:
-            skipped.append(ex.request)  # nothing is ever sent during replay; just not interpreted
+            if ex.request not in skipped:  # e.g. DDE manufacturer exchanges: kept raw, not re-decoded
+                skipped.append(ex.request)  # nothing is ever sent during replay; just not interpreted
             continue
         if cmd.is_at:
             if cmd.text == "ATRV" and ex.phase == "record":

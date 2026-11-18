@@ -42,8 +42,10 @@ sent and the scan records `unavailable`. Nothing is ever cleared. See DDE_FAULTS
 
 ## Continuous monitoring
 
-- No new request type: monitoring uses the same allowlisted generic OBD reads plus the
-  adapter-only `ATRV`. No DPF regeneration, fan activation, DTC clearing or adaptation
+- No new generic request type: monitoring uses the same allowlisted generic OBD reads plus
+  the adapter-only `ATRV`. BMW DDE reads are added only through the guarded DDE path
+  (DDE-03/06), only while the ECU answers, never after ECU silence or an adapter-only
+  reconnect, with a bounded share of link time. Today no real DDE request is executable. No DPF regeneration, fan activation, DTC clearing or adaptation
   reset is possible, and no BMW-specific request exists.
 - When the ECU stops answering (typically ignition off) the recorder sends no vehicle
   requests; it does not try to wake modules. Only the adapter voltage (`ATRV`, adapter-local)

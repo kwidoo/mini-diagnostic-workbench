@@ -198,6 +198,9 @@ class ObdClient:
         self.probe_timeout_s = 15.0  # the 0100 bootstrap probe: protocol search can take seconds
         self.adapter = AdapterInfo()
         self.capabilities: Capabilities | None = None
+        self.dde_unsupported: str | None = (
+            None  # DDE-03: adapter proved unable to address the DDE (this connection)
+        )
         self.family = "unsupported"
         self._gen: int | None = None
         self._initialised_once = False  # a failed re-init is retried on the next query

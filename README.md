@@ -14,7 +14,7 @@ regeneration, codes or programs anything. See [docs/SAFETY.md](docs/SAFETY.md).
 | | Status |
 |---|---|
 | Generic OBD live data (service 01), freeze frame (02), stored / pending / permanent DTCs (03 / 07 / 0A), vehicle info (09), raw monitor results (06) | Implemented. What the car actually supports is discovered at connect time. |
-| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available.** Shown as "not supported / not measured". Needs a BMW-capable tester. |
+| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available for this car yet.** A gated, read-only DDE path exists (capability check, request catalog, guarded transport, fault memory in scans, live values in the continuous recording; docs/DDE_*.md), but no BMW request is verified, so none is sent and nothing is shown as a value. Today a BMW-capable tester is still needed. |
 | Porsche ME7.8 specific data | **Not available**, same reason. |
 
 Details: [docs/OBD_SUPPORT_MATRIX.md](docs/OBD_SUPPORT_MATRIX.md).
@@ -139,6 +139,7 @@ backend/app/
   acquisition/   recorder, sampling metrics, live hub                  <- shared
   storage/       SQLite, transcript replay, export                     <- shared
   manufacturer/  read-only extension interface, off unless verified
+    bmw/         DDE capability, request catalog, guarded transport, faults, live values
   api/  cli.py  service.py
 frontend/        Vue 3 + TypeScript + Vite + Pinia + Tailwind v4
 fixtures/        synthetic transcripts
