@@ -31,17 +31,18 @@ diagnostics are not implemented. Follow the
 checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
 real session.
 
-### Last verified test run (2026-11-17, Linux VM, Python 3.12+, Node 22)
+### Last verified test run (2026-11-18, Docker on macOS: python:3.12-slim image, node:22-slim)
 
 ```
-$ cd backend && uv run ruff check app tests && uv run pytest
+$ make docker-test   # backend: ruff check + pytest; frontend: vue-tsc --noEmit + vitest
 All checks passed!
-301 passed in 153.13s
-$ cd frontend && npm run typecheck && npm test
-> vue-tsc --noEmit
- Test Files  6 passed (6)
-      Tests  35 passed (35)
+450 passed
+ Test Files  10 passed (10)
+      Tests  55 passed (55)
 ```
+
+The BMW DDE work (DDE-01..06) is covered by `tests/test_dde_*.py` and
+`src/__tests__/dde-*.spec.ts`, against the simulator's invented DDE only.
 
 Continuous monitoring (docs/MONITORING.md) is covered by `tests/test_monitoring.py`,
 `tests/test_monitoring_api.py` and `src/__tests__/monitoring.spec.ts`, against synthetic
