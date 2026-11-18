@@ -92,6 +92,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "dde-catalog", help="DDE-02: BMW DDE request catalog - per metric executable / blocked and why"
     )
+    p = sub.add_parser(
+        "dde-settings",
+        help="DDE-03: opt in / out of gated BMW DDE reads and record the DDE variant you confirmed "
+        "(default: opted out). Shows what is executable and why not",
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--opt-in", action="store_true", help="allow manufacturer reads that pass every gate")
+    g.add_argument("--opt-out", action="store_true")
+    g2 = p.add_mutually_exclusive_group()
+    g2.add_argument("--variant", default=None, help="DDE variant as confirmed by a BMW-capable tester")
+    g2.add_argument("--clear-variant", action="store_true")
     p = sub.add_parser("inventory", help="list supported PIDs and read each once")
     _connection_args(p)
     p.add_argument("--read-vin", action="store_true")
@@ -454,6 +465,31 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             print(f"  {name:<34}{quality:<14}{val[:60]:<62}{src}")
         if not a.session:
             print(f"export for review (VIN redacted): mini-obd export --session {sid}", file=sys.stderr)
+        return 0
+
+    if a.cmd == "dde-settings":
+        if a.opt_in or a.opt_out or a.variant is not None or a.clear_variant:
+            wb.set_dde_settings(
+                opt_in=True if a.opt_in else (False if a.opt_out else None),
+                confirmed_variant=a.variant,
+                clear_variant=a.clear_variant,
+            )
+        st = wb.dde_status()
+        if a.json:
+            print(json.dumps(st, indent=2))
+            return 0
+        if not st["supported"]:
+            print(f"{st['vehicle_profile']}: no BMW DDE")
+            return 0
+        s_ = st["settings"]
+        print(
+            f"opt-in: {'YES' if s_.get('opt_in') else 'no'}; confirmed DDE variant: {s_.get('confirmed_variant') or '-'}"
+        )
+        print(
+            f"catalog {st['version']}; adapter verdict: {st['context']['adapter_verdict'] or 'not assessed'}"
+        )
+        for m in st["availability"]:
+            print(f"  {m['metric']:<30}{m['status']:<11}{(m['reasons'] or [''])[0][:80]}")
         return 0
 
     if a.cmd == "dde-catalog":

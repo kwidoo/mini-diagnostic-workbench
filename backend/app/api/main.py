@@ -74,6 +74,12 @@ class ProfileBody(BaseModel):
     id: str
 
 
+class DdeSettingsBody(BaseModel):
+    opt_in: bool | None = None  # explicit user choice; default stays OFF
+    confirmed_variant: str | None = Field(None, max_length=80)
+    clear_variant: bool = False
+
+
 class ReplayBody(BaseModel):
     fixture: str
 
@@ -251,6 +257,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         sid = wb.dde_capability(body.label, body.read_vin)
         detail = _session_detail(store, sid)
         return {**detail, "report": detail["meta"]["dde_capability"]}
+
+    @app.get("/api/dde/status")
+    def dde_status() -> dict[str, Any]:
+        return wb.dde_status()
+
+    @app.put("/api/dde/settings")
+    def dde_settings(body: DdeSettingsBody) -> dict[str, Any]:
+        wb.set_dde_settings(body.opt_in, body.confirmed_variant, body.clear_variant)
+        return wb.dde_status()
 
     @app.get("/api/dde/catalog")
     def dde_catalog() -> dict[str, Any]:

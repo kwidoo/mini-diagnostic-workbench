@@ -282,3 +282,16 @@ export interface DdeCapabilityReport {
     manufacturer_transport: { verdict: ManufacturerTransportVerdict; blockers: string[]; unverified: string[]; meaning: string }
   }
 }
+
+/** DDE-03: catalog availability under the current opt-in / variant / adapter verdict. */
+export interface DdeAvailability {
+  metric: string; title?: string; priority?: string; kind?: string
+  status: 'executable' | 'blocked' | 'unavailable'; reasons: string[]; establish_by?: string[]
+}
+export interface DdeStatus {
+  vehicle_profile: string; supported: boolean
+  settings?: { opt_in: boolean; confirmed_variant: string | null; updated_at?: number }
+  connected?: boolean; source?: string; version?: string; synthetic?: boolean
+  context?: { opted_in: boolean; confirmed_variant: string | null; adapter_verdict: string | null; synthetic_session: boolean }
+  availability?: DdeAvailability[]
+}

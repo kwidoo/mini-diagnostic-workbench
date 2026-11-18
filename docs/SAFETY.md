@@ -19,7 +19,8 @@ service or data identifiers.
 | Transports | Only accept `AllowedCommand` objects. Passing a string raises. |
 | Client | `ObdClient` has no method that takes a free-form command. |
 | Service, API, CLI, UI | No raw console, no endpoint or command that forwards adapter text. Tests assert this for the route table and the UI controls. |
-| Manufacturer extensions | Off. An extension can only declare requests that already pass the allowlist, which today admits no manufacturer request. |
+| Manufacturer extensions | Off. An extension can only declare requests that already pass the allowlist, which admits no manufacturer request. |
+| BMW DDE guarded path (DDE-03) | Separate, typed path: only `ApprovedRequest` objects built by `guarded.approve()` from a catalog entry that passes every gate (enabled, complete, pure read, vehicle-verified, user opt-in, confirmed variant, decoder version, DDE-01 candidate verdict). No entry passes today. Exact patterns for the six addressing AT commands; read-only services only; set-up / request / restore under one transport lock; failed restore invalidates the connection (re-init from ATZ). |
 | Tests | `tests/test_allowlist.py` runs scan + inventory + recording against the simulator and checks every command the fake adapter ever received. |
 
 `ATZ` resets the adapter, not the car. `ATSP0` asks the adapter to auto-detect the

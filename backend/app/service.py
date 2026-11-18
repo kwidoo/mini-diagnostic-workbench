@@ -437,11 +437,93 @@ class Workbench:
             )
         return sid
 
-    def latest_dde_capability(self, profile_id: str | None = None) -> dict[str, Any] | None:
+    # -- DDE-03: gated manufacturer reads -----------------------------------------------------
+    def dde_settings(self, profile_id: str | None = None) -> dict[str, Any]:
+        """User-controlled DDE settings per vehicle profile: explicit opt-in (default OFF) and the
+        DDE variant as confirmed by the user (e.g. from a BMW tester printout; never inferred)."""
+        prof = get_profile(profile_id) if profile_id else self.profile
+        return self.store.get_setting(f"dde:{prof.id}", {"opt_in": False, "confirmed_variant": None})
+
+    def set_dde_settings(
+        self, opt_in: bool | None = None, confirmed_variant: str | None = None, clear_variant: bool = False
+    ) -> dict[str, Any]:
+        prof = self.profile
+        if not prof.supports_dde:
+            raise ValueError(f"{prof.id} has no BMW DDE")
+        cur = dict(self.dde_settings())
+        if opt_in is not None:
+            cur["opt_in"] = bool(opt_in)
+        if clear_variant:
+            cur["confirmed_variant"] = None
+        elif confirmed_variant is not None:
+            v = confirmed_variant.strip()
+            if not v or len(v) > 80:
+                raise ValueError("confirmed variant must be 1..80 characters")
+            cur["confirmed_variant"] = v
+        cur["updated_at"] = time.time()
+        self.store.set_setting(f"dde:{prof.id}", cur)
+        return cur
+
+    def dde_context(self):
+        """ExecutionContext for the current connection: opt-in + variant from the settings, the
+        DDE-01 verdict from the latest REAL capability report, simulator or real."""
+        from app.manufacturer.bmw.catalog import ExecutionContext
+
+        st = self.dde_settings()
+        synthetic = self.source != "real"
+        verdict = None
+        if not synthetic:
+            rep = self.latest_dde_capability(real_only=True)
+            verdict = rep["verdicts"]["manufacturer_transport"]["verdict"] if rep else None
+        return ExecutionContext(
+            opted_in=bool(st.get("opt_in")),
+            confirmed_variant=st.get("confirmed_variant"),
+            adapter_verdict=verdict,
+            synthetic_session=synthetic,
+        )
+
+    def dde_catalog(self):
+        """Real catalog for a real adapter; the SYNTHETIC catalog only against the simulator."""
+        from app.manufacturer.bmw.catalog import default_catalog
+
+        if self.source == "simulator":
+            from app.manufacturer.bmw.synthetic import synthetic_catalog
+
+            return synthetic_catalog()
+        return default_catalog()
+
+    def dde_runtime(self):
+        """A DdeRuntime for the current connection, or None (no connection / no DDE on this profile)."""
+        from app.manufacturer.bmw.runtime import DdeRuntime
+
+        if self.client is None or not self.profile.supports_dde:
+            return None
+        return DdeRuntime(self.dde_catalog(), self.dde_context(), self.client)
+
+    def dde_status(self) -> dict[str, Any]:
+        prof = self.profile
+        if not prof.supports_dde:
+            return {"vehicle_profile": prof.id, "supported": False}
+        cat = self.dde_catalog()
+        ctx = self.dde_context()
+        return {
+            "vehicle_profile": prof.id,
+            "supported": True,
+            "settings": self.dde_settings(),
+            "connected": self.client is not None,
+            "source": self.source,
+            **cat.describe(ctx),
+        }
+
+    def latest_dde_capability(
+        self, profile_id: str | None = None, real_only: bool = False
+    ) -> dict[str, Any] | None:
         """Most recent stored capability report for a vehicle profile (None if never run)."""
         prof = get_profile(profile_id) if profile_id else self.profile
         for s in reversed(self.store.list_sessions(prof.id, order="rowid")):
             if s["kind"] == "capability" and s["meta"].get("dde_capability"):
+                if real_only and s["synthetic"]:
+                    continue
                 return s["meta"]["dde_capability"]
         return None
 

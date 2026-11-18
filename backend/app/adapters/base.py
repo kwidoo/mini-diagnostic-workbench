@@ -122,6 +122,8 @@ class Transport(ABC):
         self.init_failures = 0
         self._attempt: InitAttempt | None = None  # the only attempt allowed to send/complete
         self._tainted_generation: int | None = None  # connection that lost sync (must be discarded)
+        self.manufacturer_transactions = 0  # DDE-03 guarded transactions sent on this transport
+        self.manufacturer_restore_failures = 0  # ... whose baseline restore failed (connection discarded)
 
     # -- lifecycle ----------------------------------------------------------
     @abstractmethod
@@ -143,6 +145,8 @@ class Transport(ABC):
             "resyncs": self.resyncs,
             "init_state": self.init_state,
             "init_failures": self.init_failures,
+            "manufacturer_transactions": self.manufacturer_transactions,
+            "manufacturer_restore_failures": self.manufacturer_restore_failures,
         }
 
     # -- synchronisation --------------------------------------------------------
@@ -228,6 +232,73 @@ class Transport(ABC):
                 )
             return self._exchange(cmd, timeout_s)
 
+    def send_manufacturer(self, approved, timeout_s: float | None = None) -> list[Exchange]:
+        """DDE-03: one manufacturer transaction - set-up, request, restore - under ONE lock hold, so
+        no generic request can run in between. Only an ``ApprovedRequest`` (built by
+        ``app.manufacturer.bmw.guarded.approve`` from an executable catalog entry) is accepted.
+
+        Set-up and restore commands must each answer exactly ``OK``. A failed set-up skips the
+        request. The restore sequence always runs while the connection is usable; if it fails, or
+        the connection was lost / desynchronised, the connection is invalidated so the next
+        request re-initialises the adapter from ATZ (fail closed: addressing never leaks into
+        generic OBD). Returns every exchange in order; a dropped connection re-raises
+        :class:`TransportClosedError` after the clean-up, with ``exchanges`` attached.
+        """
+        from app.manufacturer.bmw.guarded import ApprovedRequest, at_ok
+
+        if not isinstance(approved, ApprovedRequest):
+            raise ForbiddenRequestError("manufacturer requests must be ApprovedRequest objects")
+        with self._lock:
+            self._sync_and_connect()
+            if self.initialized_generation is None or self.generation != self.initialized_generation:
+                raise TransportUnsyncedError(
+                    "adapter is not initialised on the current connection; no manufacturer request is sent"
+                )
+            exs: list[Exchange] = []
+            closed: TransportClosedError | None = None
+            restore_ok = True
+            try:
+                setup_ok = True
+                for cmd in approved.setup:
+                    ex = self._exchange(cmd, None)
+                    exs.append(ex)
+                    if not at_ok(ex):
+                        setup_ok = False
+                        break
+                if setup_ok:
+                    exs.append(self._exchange(approved.request, timeout_s))
+            except TransportClosedError as exc:
+                closed = exc
+                if exc.exchange is not None:
+                    exs.append(exc.exchange)
+            if closed is None and self.synced and self.state == "connected":
+                try:
+                    for cmd in approved.restore:
+                        ex = self._exchange(cmd, None)
+                        exs.append(ex)
+                        if not at_ok(ex):
+                            restore_ok = False
+                            break
+                except TransportClosedError as exc:
+                    closed = exc
+                    if exc.exchange is not None:
+                        exs.append(exc.exchange)
+            if closed is not None or not self.synced or not restore_ok:
+                self.manufacturer_restore_failures += 1
+                reason = (
+                    "manufacturer addressing could not be restored to the generic baseline; the adapter is "
+                    "re-initialised (ATZ) before the next request"
+                )
+                self.synced = False
+                self._tainted_generation = self.generation
+                self.initialized_generation = None
+                self.last_error = reason
+            self.manufacturer_transactions += 1
+        if closed is not None:
+            closed.exchanges = exs  # type: ignore[attr-defined]
+            raise closed
+        return exs
+
     def _send_init(self, attempt: InitAttempt, cmd: AllowedCommand, timeout_s: float | None) -> Exchange:
         if not isinstance(cmd, AllowedCommand):
             raise ForbiddenRequestError("transports only accept AllowedCommand objects")
@@ -255,8 +326,9 @@ class Transport(ABC):
                 f"(attempt on connection #{attempt.generation}); restart initialisation from ATZ"
             )
 
-    def _exchange(self, cmd: AllowedCommand, timeout_s: float | None) -> Exchange:
-        """One request -> response-until-prompt on the current connection (lock held)."""
+    def _exchange(self, cmd, timeout_s: float | None) -> Exchange:
+        """One request -> response-until-prompt on the current connection (lock held). ``cmd`` is an
+        AllowedCommand, or a GuardedCommand inside send_manufacturer (never a string)."""
         self._cancel.clear()
         if self._last_end is not None and self.min_interval_s > 0:
             wait = self.min_interval_s - (self.clock.monotonic() - self._last_end)

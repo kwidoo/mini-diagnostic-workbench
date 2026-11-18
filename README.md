@@ -84,6 +84,7 @@ mini-obd inventory                              # which PIDs the ECU supports, e
 mini-obd dde-capability                         # DDE-01: adapter + ECU identity report, no BMW request
 mini-obd dde-capability --session <id>          # same, offline from a stored session (read-only)
 mini-obd dde-catalog                            # DDE-02: BMW request catalog, per metric blocked / executable
+mini-obd dde-settings --opt-in --variant <v>    # DDE-03: opt in + record the DDE variant a BMW tester confirmed
 mini-obd record --duration 120 --profile idle   # timed recording with pre/post fault scans
 mini-obd record --profile mini_extended_monitoring --until-stop   # continuous; Ctrl-C stops and saves
 mini-obd annotate --event fan_running           # predefined event (also while another process records)

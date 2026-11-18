@@ -5,7 +5,19 @@ import type { CapField } from '../types'
 
 const wb = useWorkbench()
 const readVin = ref(false)
-onMounted(() => wb.loadDdeCapability())
+const variant = ref('')
+onMounted(async () => {
+  await Promise.all([wb.loadDdeCapability(), wb.loadDdeStatus()])
+  variant.value = wb.ddeStatus?.settings?.confirmed_variant ?? ''
+})
+const dde = computed(() => wb.ddeStatus)
+function toggleOptIn(e: Event) {
+  return wb.saveDdeSettings({ opt_in: (e.target as HTMLInputElement).checked })
+}
+function saveVariant() {
+  const v = variant.value.trim()
+  return wb.saveDdeSettings(v ? { confirmed_variant: v } : { clear_variant: true })
+}
 const rep = computed(() => wb.ddeCapability)
 const canRun = computed(() => wb.connected && !wb.status?.operation && !wb.busy)
 
@@ -73,5 +85,37 @@ const verdictClass = (v: string) =>
       </p>
     </template>
     <p v-else class="mt-2 text-ink-2" data-test="dde-none">No capability check stored for this vehicle yet.</p>
+
+    <template v-if="dde?.supported && dde.settings">
+      <h3 class="label mt-4">Manufacturer reads (gated, off by default)</h3>
+      <p class="text-ink-2">
+        A BMW request runs only when the catalog entry is vehicle-verified, you opted in, the DDE variant you confirmed matches,
+        and the adapter verdict above is a candidate. Nothing is sent otherwise.
+      </p>
+      <div class="mt-1 flex flex-wrap items-end gap-3">
+        <label class="flex items-center gap-1">
+          <input type="checkbox" data-test="dde-opt-in" :checked="dde.settings.opt_in" @change="toggleOptIn" /> I opt in to read-only manufacturer reads
+        </label>
+        <label>
+          <span class="label block">DDE variant confirmed by a BMW tester</span>
+          <input v-model="variant" class="field w-56" data-test="dde-variant" placeholder="not confirmed" />
+        </label>
+        <button class="btn" data-test="dde-save-variant" @click="saveVariant">Save variant</button>
+      </div>
+      <p class="mt-1" data-test="dde-catalog-summary">
+        Catalog {{ dde.version }}{{ dde.synthetic ? ' (SYNTHETIC, simulator only)' : '' }}:
+        {{ dde.availability?.filter((m) => m.status === 'executable').length ?? 0 }} of {{ dde.availability?.length ?? 0 }} metrics executable.
+      </p>
+      <table class="mt-1 w-full text-left" data-test="dde-availability">
+        <thead><tr class="label"><th>Metric</th><th>Status</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr v-for="m in dde.availability" :key="m.metric">
+            <td>{{ m.title ?? m.metric }}</td>
+            <td><span class="badge" :class="m.status === 'executable' ? 'text-good' : 'text-warn'">{{ m.status }}</span></td>
+            <td class="text-ink-2">{{ m.reasons[0] ?? '' }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </template>
   </section>
 </template>
