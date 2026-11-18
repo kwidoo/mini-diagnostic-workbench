@@ -307,10 +307,61 @@ exactly as before. VIN redaction applies to every file. The transcript header ca
 the recording context, so `mini-obd replay transcript.jsonl` rebuilds an equivalent
 session (including ATRV samples and events) for offline analysis.
 
+## BMW DDE values in the same recording (DDE-06)
+
+There is no separate DDE logger and no DDE-only recording command. `mini_extended_monitoring`
+gets manufacturer items only when the DDE path is executable (DDE-02 catalog entry
+verified for the confirmed variant, user opt-in, DDE-01 adapter verdict `candidate`).
+**For the real car none is today**, so real recordings record `meta.dde.status =
+"not_polled"` with the reason and run generic-only, exactly as before. Everything below
+is exercised with the simulator's invented DDE (`mini_dde_drive`, `mini_dde_synthetic`).
+
+- **One scheduler, one lock, one session.** DDE items (`dde:<signal_key>`) sit in the
+  same deadline scheduler as the generic PIDs, in the medium / slow tiers only (never fast).
+  Each one is one guarded transaction under the transport lock (DDE-03). Samples, exchanges
+  and events share one SQLite session and one timeline.
+- **Session metadata at start:** `meta.dde` = opt-in, confirmed variant, adapter verdict,
+  synthetic, catalog version, the exact signal plan (`metric`, `request_id`, tier, base
+  interval, semantics) and per-metric availability. It is persisted before the first sample.
+- **Bandwidth:** a DDE transaction costs about eleven adapter exchanges (set-up, request,
+  restore). The recorder keeps DDE at most 35 % of measured link time by stretching DDE
+  intervals first (`dde_scale`, up to x8, logged in `adjustments` with `dde_share`). The
+  existing tier adaptation still applies, so the fast generic tier keeps its cadence. A
+  signal that keeps answering NO DATA / negative is backed off (DDE-05). An adapter that
+  cannot address the DDE stops all DDE reads for the connection after the first refusal.
+- **Silence and shutdown:** DDE items are read only in the `running` state. After
+  `ecu_communication_lost`, during `adapter_unreachable`, and after an adapter-only
+  reconnect, no manufacturer request is sent. A DDE read never re-initialises the adapter
+  (`not_attempted` instead); generic polling re-initialises under the existing rules first.
+  Fault-memory reads happen only in the pre / post scans (DDE-04), never in the loop.
+- **Regeneration:** `dde_regeneration_started` / `_ended` events (origin `observed`,
+  confidence `measured`) and `dpf.confirmed_regenerations` come only from a fresh, decoded
+  flag of a catalog entry whose semantics are `regeneration_active_flag`. Freshness is judged
+  against the flag's actual read spacing. A gap or a failed read makes the state `unknown`,
+  never "inactive". The confirmed span runs from the first to the last active reading, and
+  the end is reported as a bound (`ended_between_rel_s`). The generic "possible
+  regeneration" heuristic remains a separate, inferred list, and both are shown side by side.
+- **Analysis** (`monitoring.json` → `dde`, from `app/diagnostics/dde.py`): per-signal
+  provenance (`bmw_dde`), ok / failed counts, min / median / max, decoder versions;
+  commanded − actual deltas (EGR, air mass, boost, rail) only for samples read within
+  2.5 s of each other, labelled as association in time; limitations. DDE values are never
+  pooled with generic PIDs (DDE air mass is not compared as if it were PID 10). History
+  rows add `dde_confirmed_regenerations` (None without DDE data) and `dde_soot_last`.
+- **Dashboard:** Live shows a "BMW DDE values" panel (value, quality, age / stale, interval,
+  suspended, regeneration *confirmed by DDE* / *unknown*), or why nothing is read (opt-in
+  off, no verified signal). Session details show confirmed-by-DDE regenerations next to
+  the count inferred from generic OBD, plus DDE signal statistics. Charts receive DDE
+  signals as their own series (`provenance: bmw_dde`, pid > 0xFF).
+- **Export:** `dde_monitoring.json`, a "BMW DDE manufacturer values" report section, and
+  provenance columns in `samples.csv` (only when DDE samples exist). Replay restores DDE
+  readings as recorded. Old sessions and DBs load, analyse and export exactly as before
+  (`dde.status = "not_recorded"`).
+
 ## Not available through this tool
 
-DPF regeneration state and request, soot mass, ash load, distance/time since the last
-regeneration, failed-regeneration counters, BMW fault memory (480A, 4862), the meaning
+For the real car, still: DPF regeneration state and request, soot mass, ash load, distance/time since the last
+regeneration, failed-regeneration counters, BMW fault memory (480A, 4862) - none has a
+verified DDE request yet (DDE_REQUEST_CATALOG.md) - the meaning
 of manufacturer-range generic codes such as P115D for this DDE variant, EGR
 target/actual, MAF and boost targets, fan state. Extended standard PIDs (7A/7B/7C DPF, 78/79 EGT, 73 exhaust
 pressure, 8B aftertreatment, 86 PM sensor, 69, 6B) are stored raw only if the ECU

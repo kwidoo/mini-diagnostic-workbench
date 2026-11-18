@@ -20,7 +20,7 @@ from app.obd.client import ObdError
 from app.parameters.standard_pids import PIDS, RAW_ONLY_PIDS, pid_name
 from app.service import BusyError, NotConnectedError, Workbench
 from app.storage.db import Store
-from app.storage.export import build_files, build_zip
+from app.storage.export import build_files, build_zip, render_dde_faults
 from app.storage.transcript import ingest_file
 from app.vehicles.profiles import MONITORING_EVENT_IDS, PROFILES
 
@@ -231,6 +231,8 @@ def _print_scans(store: Store, sid: str) -> None:
             for r in ff.readings:
                 if r.value is not None:
                     print(f"    {r.name}: {r.value} {r.unit or ''}")
+        for line in render_dde_faults(sc):
+            print("  " + line.replace("**", ""))
 
 
 def _print_findings(findings) -> None:
@@ -354,6 +356,19 @@ def _print_monitoring(m: dict) -> None:
         print(f"limitation: {line}")
     for e in m["link"]:
         print(f"link {t(e['t_rel_s'])}: {e['type']}")
+    d = m.get("dde") or {}
+    if d.get("status") not in (None, "not_recorded"):
+        print(
+            f"BMW DDE{' [SYNTHETIC]' if d.get('synthetic') else ''}: {d['status']}"
+            + (f" ({d['reason']})" if d.get("reason") else "")
+        )
+        for x in d["signals"]:
+            st = x["stats"] or {}
+            print(
+                f"  {x['signal_key']:<30}{x['status']:<10}ok {x['samples_ok']:<5} last {st.get('last', '-')} {x['unit'] or ''}"
+            )
+        for e in d["regeneration"]["confirmed"]:
+            print(f"  regeneration CONFIRMED by DDE at {t(e['t_start_rel_s'])}: {e['duration_s']:.0f} s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -536,10 +551,20 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
                 "\nsupported but raw-only (no verified decoder in this tool): "
                 + ", ".join(f"{p:02X} {RAW_ONLY_PIDS[p]}" for p in raw)
             )
-        print("\nmanufacturer-specific parameters: UNAVAILABLE through this tool")
-        for ext in wb.registry.status(wb.profile.ecu_ids):
-            for prm in ext["parameters"]:
-                print(f"  - {prm['name']}: {prm['status']}")
+        dl = store.get_session(sid)["meta"].get("dde_live")
+        if dl and any(m["status"] == "executable" for m in dl["availability"]):
+            tag = " [SYNTHETIC catalog, simulator only]" if dl["synthetic"] else ""
+            print(f"\nBMW DDE live signals (catalog {dl['catalog_version']}){tag}:")
+            for m in dl["availability"]:
+                why = "" if m["status"] == "executable" else f" - {(m['reasons'] or [''])[0][:80]}"
+                print(f"  - {m['title'] or m['metric']}: {m['status']}{why}")
+        else:
+            print(
+                "\nmanufacturer-specific parameters: UNAVAILABLE through this tool (see: mini-obd dde-settings)"
+            )
+            for ext in wb.registry.status(wb.profile.ecu_ids):
+                for prm in ext["parameters"]:
+                    print(f"  - {prm['name']}: {prm['status']}")
         return 0
 
     if a.cmd == "record":

@@ -73,7 +73,12 @@ to DPF or EGR data and needs no manufacturer protocol.
 | Exhaust back-pressure | **unavailable** (raw only if the ECU offers PID 73) |
 | Injector balance / quantity corrections | **unavailable** |
 | Commanded rail pressure | **unavailable** |
-| BMW fault memory (4862, 480A, ...) | **unavailable**; only generic P-codes are read |
+| BMW fault memory (4862, 480A, ...) | **unavailable**; only generic P-codes are read. The gated read path exists (DDE_FAULTS.md) and records `unavailable` until a request is verified |
+
+DDE path status (DDE-01..06): capability assessment works on the real connection; the
+request catalog, guarded transport, fault-memory and live-value handling, and monitoring
+integration are implemented and tested **against the simulator only**. No BMW request is
+executable for this car until the blockers in DDE_REQUEST_CATALOG.md are cleared.
 
 ## BMW DDE: what would be needed
 

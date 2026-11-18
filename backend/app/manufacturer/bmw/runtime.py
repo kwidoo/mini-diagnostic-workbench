@@ -37,8 +37,21 @@ class DdeRuntime:
         self.catalog = catalog
         self.ctx = ctx
         self.client = client
-        self.unsupported: str | None = None  # set once the adapter proved unable; then nothing is sent
+        # set once the adapter proved unable; then nothing is sent. Remembered on the client, i.e. for
+        # the whole adapter connection (scans, inventory and recordings share it)
+        self._unsupported: str | None = None
         self.counts: dict[str, int] = {}
+
+    @property
+    def unsupported(self) -> str | None:
+        return self._unsupported or getattr(self.client, "dde_unsupported", None)
+
+    def _mark_unsupported(self, why: str | None) -> None:
+        self._unsupported = why or "adapter cannot provide the documented addressing"
+        try:
+            self.client.dde_unsupported = self._unsupported
+        except AttributeError:
+            pass
 
     # -- planning -------------------------------------------------------------------------
     def executable(self, kind: str | None = None) -> list[CatalogEntry]:
@@ -75,7 +88,7 @@ class DdeRuntime:
         try:
             approved = approve(self.catalog, request_id, self.ctx, self.client.adapter.model_dump())
         except UnsupportedAdapterError as exc:
-            self.unsupported = "; ".join(exc.reasons)
+            self._mark_unsupported("; ".join(exc.reasons))
             return self._result(e, "unsupported_adapter", self.unsupported)
         except NotApprovedError as exc:
             return self._result(e, "not_attempted", "; ".join(exc.reasons))
@@ -102,7 +115,9 @@ class DdeRuntime:
             # the request was never sent: which set-up step failed?
             bad = next((x for x in exs if x.request.startswith("AT") and not at_ok(x)), None)
             if bad is not None and "?" in bad.response_text:
-                self.unsupported = f"adapter rejected {bad.request} ('?'): it cannot provide this addressing"
+                self._mark_unsupported(
+                    f"adapter rejected {bad.request} ('?'): it cannot provide this addressing"
+                )
                 return self._result(e, "unsupported_adapter", self.unsupported, exchange_seqs=seqs)
             q = "disconnected" if closed else "error"
             what = f"{bad.request}: {bad.status} {bad.response_text!r}" if bad else "no exchange"
@@ -113,7 +128,7 @@ class DdeRuntime:
         ecu = f"{a.rx_can_id}" + (f"/{a.rx_ext_address}" if a and a.rx_ext_address else "") if a else None
         raw = req.response_hex
         if quality == "unsupported_adapter":
-            self.unsupported = detail
+            self._mark_unsupported(detail)
         if quality != "ok" or payload is None:
             return self._result(e, quality, detail, raw_hex=raw, nrc=nrc, ecu=ecu, payload=payload, **timing)
         if e.kind != "live_value" and e.kind != "identification":

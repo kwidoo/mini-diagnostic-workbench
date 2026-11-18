@@ -14,7 +14,7 @@ regeneration, codes or programs anything. See [docs/SAFETY.md](docs/SAFETY.md).
 | | Status |
 |---|---|
 | Generic OBD live data (service 01), freeze frame (02), stored / pending / permanent DTCs (03 / 07 / 0A), vehicle info (09), raw monitor results (06) | Implemented. What the car actually supports is discovered at connect time. |
-| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available.** Shown as "not supported / not measured". Needs a BMW-capable tester. |
+| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available for this car yet.** A gated, read-only DDE path exists (capability check, request catalog, guarded transport, fault memory in scans, live values in the continuous recording; docs/DDE_*.md), but no BMW request is verified, so none is sent and nothing is shown as a value. Today a BMW-capable tester is still needed. |
 | Porsche ME7.8 specific data | **Not available**, same reason. |
 
 Details: [docs/OBD_SUPPORT_MATRIX.md](docs/OBD_SUPPORT_MATRIX.md).
@@ -31,17 +31,18 @@ diagnostics are not implemented. Follow the
 checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
 real session.
 
-### Last verified test run (2026-11-17, Linux VM, Python 3.12+, Node 22)
+### Last verified test run (2026-11-18, Docker on macOS: python:3.12-slim image, node:22-slim)
 
 ```
-$ cd backend && uv run ruff check app tests && uv run pytest
+$ make docker-test   # backend: ruff check + pytest; frontend: vue-tsc --noEmit + vitest
 All checks passed!
-301 passed in 153.13s
-$ cd frontend && npm run typecheck && npm test
-> vue-tsc --noEmit
- Test Files  6 passed (6)
-      Tests  35 passed (35)
+450 passed
+ Test Files  10 passed (10)
+      Tests  55 passed (55)
 ```
+
+The BMW DDE work (DDE-01..06) is covered by `tests/test_dde_*.py` and
+`src/__tests__/dde-*.spec.ts`, against the simulator's invented DDE only.
 
 Continuous monitoring (docs/MONITORING.md) is covered by `tests/test_monitoring.py`,
 `tests/test_monitoring_api.py` and `src/__tests__/monitoring.spec.ts`, against synthetic
@@ -139,6 +140,7 @@ backend/app/
   acquisition/   recorder, sampling metrics, live hub                  <- shared
   storage/       SQLite, transcript replay, export                     <- shared
   manufacturer/  read-only extension interface, off unless verified
+    bmw/         DDE capability, request catalog, guarded transport, faults, live values
   api/  cli.py  service.py
 frontend/        Vue 3 + TypeScript + Vite + Pinia + Tailwind v4
 fixtures/        synthetic transcripts
