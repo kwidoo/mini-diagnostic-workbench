@@ -4,6 +4,7 @@ import { ADAPTER_VOLTAGE_KEY, staleAfterMs, useWorkbench } from '../../stores/wo
 import type { PidRef } from '../../types'
 import LineChart from '../LineChart.vue'
 import DataBadge from './DataBadge.vue'
+import DdeMonitorPanel from './DdeMonitorPanel.vue'
 import EventMarkerBar from './EventMarkerBar.vue'
 
 const wb = useWorkbench()
@@ -16,6 +17,7 @@ let timer: ReturnType<typeof setInterval> | undefined
 const monitoringProfile = computed(() => wb.profile?.recording_profiles.find((p) => p.monitoring) ?? null)
 onMounted(() => {
   timer = setInterval(() => (now.value = Date.now()), 500)
+  void wb.loadDdeStatus()
   if (wb.connected && monitoringProfile.value) void wb.loadPlan(monitoringProfile.value.id)
 })
 onUnmounted(() => clearInterval(timer))
@@ -174,11 +176,13 @@ const chartPoints = (key: number) => wb.live[key]?.points ?? []
       </div>
     </section>
 
+    <DdeMonitorPanel v-if="rec && wb.profile?.ecus.some((e) => e.id.startsWith('bmw-dde'))" :live="mon?.dde ?? null" />
+
     <section v-if="monitoringProfile && wb.plan" class="panel text-sm" data-test="dpf-live">
       <h2 class="h2">DPF data availability</h2>
       <ul class="grid gap-1 md:grid-cols-2">
         <li v-for="p in dpf" :key="p.pid" :data-test="`dpf-${p.hex}`">{{ p.name }} ({{ p.hex }}) <DataBadge :kind="p.kind" /></li>
-        <li>Soot load, regeneration state, regeneration history <DataBadge kind="not_available" /> <span class="text-xs text-ink-2">BMW DDE values; not read by this tool</span></li>
+        <li>Soot load, regeneration state, regeneration history <DataBadge kind="not_available" /> <span class="text-xs text-ink-2">BMW DDE values; only with a verified DDE signal (see BMW DDE values)</span></li>
       </ul>
       <p class="mt-1 text-xs text-ink-2">
         Raw-only PIDs are stored as bytes and never shown as numbers. Possible regenerations are inferred afterwards (Session details) and are

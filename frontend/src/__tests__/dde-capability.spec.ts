@@ -67,3 +67,34 @@ describe('DDE capability panel (DDE-01)', () => {
     expect(w.get('[data-test=dde-synthetic]').text()).toContain('SYNTHETIC')
   })
 })
+
+describe('DDE manufacturer-read controls (DDE-03)', () => {
+  beforeEach(() => vi.unstubAllGlobals())
+
+  it('shows opt-in default off, saves the opt-in and the confirmed variant explicitly', async () => {
+    const status = {
+      vehicle_profile: 'mini', supported: true, settings: { opt_in: false, confirmed_variant: null }, version: 'dde-catalog/x',
+      synthetic: false, context: { opted_in: false, confirmed_variant: null, adapter_verdict: null, synthetic_session: false },
+      availability: [{ metric: 'dpf_soot_mass', title: 'DPF soot load', status: 'blocked', reasons: ['disabled in the catalog (enabled: false)'] }],
+    }
+    const calls = mockFetch({
+      ...baseRoutes(),
+      'GET /api/dde/capability/latest': { vehicle_profile: 'x', report: null },
+      'GET /api/dde/status': status,
+      'PUT /api/dde/settings': (b: any) => ({ body: { ...status, settings: { opt_in: !!b.opt_in, confirmed_variant: b.confirmed_variant ?? null } } }),
+    })
+    const w = await vehicleTab()
+    const box = w.get('[data-test=dde-opt-in]')
+    expect((box.element as HTMLInputElement).checked).toBe(false)
+    expect(w.get('[data-test=dde-availability]').text()).toContain('blocked')
+    expect(w.get('[data-test=dde-catalog-summary]').text()).toContain('0 of 1')
+    ;(box.element as HTMLInputElement).checked = true
+    await box.trigger('change')
+    await flushPromises()
+    expect(calls.find((c) => c.method === 'PUT')?.body).toEqual({ opt_in: true })
+    await w.get('[data-test=dde-variant]').setValue('  ')
+    await w.get('[data-test=dde-save-variant]').trigger('click')
+    await flushPromises()
+    expect(calls.filter((c) => c.method === 'PUT').at(-1)?.body).toEqual({ clear_variant: true })
+  })
+})

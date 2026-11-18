@@ -226,7 +226,7 @@ describe('MINI monitoring: session details and history', () => {
     expect(w.get('[data-test=dpf-want-soot_mass]').text()).toContain('not available')
     expect(w.get('[data-test=regen]').text()).toContain('inferred · possible')
     expect(text).not.toMatch(/confirmed regeneration[^s]/i)
-    expect(text).toContain('Confirmed regenerations: none can be confirmed')
+    expect(text).toContain('Confirmed regenerations: none (only a fresh, verified DDE flag can confirm one; generic OBD cannot)')
     expect(w.get('[data-test=battery-warning]').text()).toContain('11.9-12.1 V')
     expect(w.get('[data-test=observed-capabilities]').text()).toContain('40 request(s)')
     expect(w.findAll('[data-test=band]').length).toBeGreaterThan(0) // inferred interval shaded, not plotted as a value

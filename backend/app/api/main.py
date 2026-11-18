@@ -74,6 +74,12 @@ class ProfileBody(BaseModel):
     id: str
 
 
+class DdeSettingsBody(BaseModel):
+    opt_in: bool | None = None  # explicit user choice; default stays OFF
+    confirmed_variant: str | None = Field(None, max_length=80)
+    clear_variant: bool = False
+
+
 class ReplayBody(BaseModel):
     fixture: str
 
@@ -121,6 +127,32 @@ def _series(store: Store, sid: str) -> dict[str, Any]:
         if a.t_mono is not None:
             return round(a.t_mono - t0, 3)
         return round(a.t_wall - wall0, 3) if wall0 is not None else None  # marked after the recording
+
+    # DDE-06: manufacturer signals are their own series (provenance bmw_dde), keyed by their stable pid
+    for s in all_rows:
+        if s.get("source") != "bmw_dde":
+            continue
+        sig = signals.setdefault(
+            s["pid"],
+            {
+                "pid": s["pid"],
+                "hex": s["signal_key"],
+                "name": s["name"],
+                "unit": s["unit"],
+                "decoded": True,
+                "provenance": "bmw_dde",
+                "signal_key": s["signal_key"],
+                "points": [],
+                "failed": [],
+            },
+        )
+        if sig["unit"] is None and s["unit"]:
+            sig["unit"] = s["unit"]
+        t = round(s["t_mono"] - t0, 3)
+        if s["quality"] == "ok" and s["value"] is not None:
+            sig["points"].append([t, s["value"]])
+        elif s["quality"] not in GOOD:
+            sig["failed"].append([t, s["quality"]])
 
     ann = [{"t": rel(a), **a.model_dump()} for a in store.annotations(sid)]
     return {
@@ -251,6 +283,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         sid = wb.dde_capability(body.label, body.read_vin)
         detail = _session_detail(store, sid)
         return {**detail, "report": detail["meta"]["dde_capability"]}
+
+    @app.get("/api/dde/status")
+    def dde_status() -> dict[str, Any]:
+        return wb.dde_status()
+
+    @app.put("/api/dde/settings")
+    def dde_settings(body: DdeSettingsBody) -> dict[str, Any]:
+        wb.set_dde_settings(body.opt_in, body.confirmed_variant, body.clear_variant)
+        return wb.dde_status()
 
     @app.get("/api/dde/catalog")
     def dde_catalog() -> dict[str, Any]:

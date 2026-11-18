@@ -34,7 +34,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.manufacturer.bmw.decoders import DECODERS, DecodedValue, DecodeError
+from app.manufacturer.bmw.decoders import DECODERS, FAULT_DECODERS, DecodedValue, DecodeError
 
 CATALOG_VERSION = "dde-catalog/2026-11-18.1"
 
@@ -132,6 +132,10 @@ class CatalogEntry:
     blocked_reason: str = ""
     establish_by: tuple[str, ...] = ()
     sample_interval_s: float | None = None  # suggested polling interval for live values (DDE-06)
+    #: what a decoded value MEANS when that is documented, e.g. "regeneration_active_flag": the decoded
+    #: status {"active": bool} is the ECU's own regeneration-active flag. Only such an entry may confirm
+    #: a regeneration (DDE-06); a value without documented semantics is never interpreted that way.
+    semantics: str | None = None
 
     @property
     def complete(self) -> bool:
@@ -301,7 +305,8 @@ class RequestCatalog:
             if rivals:
                 r.append(f"ambiguous: {', '.join(rivals)} also claim this metric for the same variant")
         if e.response is not None:
-            dec = DECODERS.get(e.response.decoder_id)
+            registry = FAULT_DECODERS if e.kind == "fault_memory" else DECODERS
+            dec = registry.get(e.response.decoder_id)
             if dec is None:
                 r.append(f"decoder {e.response.decoder_id!r} is not registered")
             elif dec.version != e.response.decoder_version:
