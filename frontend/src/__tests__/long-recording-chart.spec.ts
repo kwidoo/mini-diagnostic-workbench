@@ -158,5 +158,5 @@ describe('MonitoringSession with a long recording', () => {
     expect(Number(band.attributes('x')) + Number(band.attributes('width'))).toBeLessThanOrEqual(708.01)
     expect(rpmChart.get('[data-test=line]').attributes('data-samples')).toBe(String(N))
     expect(series.signals[0].points.length).toBe(N) // stored data not reduced
-  })
+  }, 20_000) // ~4 s alone (200k-point session); the 5 s default flakes when all spec files run in parallel
 })

@@ -70,6 +70,8 @@ MAX_LOW_TIER_STRETCH = 4.0  # medium/slow are stretched up to this factor before
 BACKOFF_S = (2.0, 60.0)  # adapter unreachable: retry back-off (initial, max)
 ADAPTER_LOST_FAILS = 2  # consecutive unanswered ATRV reads (vehicle polling paused) = adapter link lost
 MAX_ADJUSTMENTS_KEPT = 200
+DDE_TARGET_SHARE = 0.35  # aim: DDE uses at most this share of wall-clock link time (a TARGET, see _adapt)
+DDE_MAX_SCALE = 8.0  # DDE intervals are stretched up to this factor to meet it; beyond: recorded as exceeded
 
 
 @dataclass
@@ -84,9 +86,14 @@ class _Item:
     suspended_until: float | None = None
     attempts: int = 0
     ok: int = 0
+    kind: str = "obd"  # obd | adapter | dde
+    metric: str | None = None  # dde: catalog signal key
+    title: str | None = None
 
     @property
     def name(self) -> str:
+        if self.kind == "dde":
+            return self.title or str(self.metric)
         return "Adapter supply voltage (ATRV)" if self.pid is None else pid_name(self.pid)
 
 
@@ -133,6 +140,8 @@ class MonitoringRecorder:
         on_state: Callable[[dict[str, Any]], None] | None = None,
         resume_probe_s: float | None = None,
         primary_ecu: str | None = None,
+        dde_live: Any | None = None,
+        dde_plan: list[dict[str, Any]] | None = None,
     ) -> None:
         self.client = client
         self.clock = client.transport.clock
@@ -149,9 +158,29 @@ class MonitoringRecorder:
             for pid in plan.get(tier, []):
                 self.items.append(_Item(f"01:{pid:02X}", tier, pid, base[tier]))
         if adapter_voltage:
-            self.items.append(_Item("adapter:ATRV", "slow", None, base["slow"]))
-        if not any(i.pid is not None for i in self.items):
+            self.items.append(_Item("adapter:ATRV", "slow", None, base["slow"], kind="adapter"))
+        if not any(i.kind == "obd" for i in self.items):
             raise ValueError("no supported signals selected for recording")
+        # DDE-06: capability-driven manufacturer items in the SAME scheduler (low tiers only)
+        self.dde = dde_live
+        self.dde_plan = list(dde_plan or []) if dde_live is not None else []
+        for d in self.dde_plan:
+            self.items.append(
+                _Item(f"dde:{d['metric']}", d["tier"], None, float(d["base_interval_s"]), kind="dde",
+                      metric=d["metric"], title=d.get("title"))
+            )  # fmt: skip
+        self._dde_semantics = {d["metric"]: d.get("semantics") for d in self.dde_plan}
+        self.dde_scale = 1.0
+        self._dde_busy = 0.0
+        self._dde_count = 0
+        self._dde_tx_s: float | None = None  # measured link time of one DDE transaction (s)
+        self._dde_status: dict[str, Any] = {}  # last scheduling decision (target, projected share, ...)
+        self.dde_last: dict[str, dict[str, Any]] = {}
+        self.dde_regen: dict[str, Any] | None = (
+            None  # last measured regeneration flag {active, t_wall, t_mono}
+        )
+        self.dde_regen_events = 0
+        self.dde_not_attempted = 0
         self.scale = {"fast": 1.0, "low": 1.0}
         self.state = "running"
         self.stats = MonitorStats()
@@ -181,7 +210,8 @@ class MonitoringRecorder:
 
     # -- helpers ------------------------------------------------------------------
     def interval(self, item: _Item) -> float:
-        return item.base_s * (self.scale["fast"] if item.tier == "fast" else self.scale["low"])
+        s = item.base_s * (self.scale["fast"] if item.tier == "fast" else self.scale["low"])
+        return s * self.dde_scale if item.kind == "dde" else s
 
     def effective_intervals(self) -> dict[str, float]:
         b = self.tiers.as_dict()
@@ -214,6 +244,10 @@ class MonitoringRecorder:
                 self.stop.wait(step)
 
     def _set_state(self, state: str) -> None:
+        if state != "running" and self.dde is not None:
+            self._dde_regen_expire(
+                "ECU communication lost" if state == "ecu_unresponsive" else "adapter connection lost"
+            )
         now = self.clock.monotonic()
         self.stats.state_time_s[self.state] += now - self._state_since
         self._state_since = now
@@ -230,7 +264,12 @@ class MonitoringRecorder:
             "capacity_rps": round(self._capacity, 2) if self._capacity else None,
             "suspended": sorted(self.stats.suspended),
             "items": {
-                i.key: {"tier": i.tier, "pid": i.pid, "interval_s": round(self.interval(i), 3)}
+                i.key: {
+                    "tier": i.tier,
+                    "pid": i.pid,
+                    "kind": i.kind,
+                    "interval_s": round(self.interval(i), 3),
+                }
                 for i in self.items
             },
             "resume_probe_s": self.resume_probe_s,
@@ -240,6 +279,7 @@ class MonitoringRecorder:
             "adapter_link": "lost" if self._adapter_lost_at is not None else "ok",
             # resuming will re-initialise the adapter first (ATZ ... 0100) on a new connection
             "resume_requires_reinit": self.ecu_paused and not self.client.link_ready(),
+            "dde": self.dde_snapshot(),
         }
 
     def _publish(self) -> None:
@@ -313,6 +353,190 @@ class MonitoringRecorder:
         except ObdError:
             return None
 
+    # -- DDE (manufacturer) reads ----------------------------------------------------------
+    def _read_dde(self, item: _Item, t0: float) -> None:
+        """One gated manufacturer read inside the running state. Manufacturer failures never count
+        towards ECU-loss detection (that is judged on generic OBD only) and never re-initialise."""
+        metric = item.metric or ""
+        assert self.dde is not None
+        if not self.dde.due(metric):  # backed off after repeated NO DATA / negative
+            return
+        r = self.dde.read(metric, ecu_answering=self._fail_run == 0)
+        dt = self.clock.monotonic() - t0
+        self._busy += dt
+        self._dde_busy += dt
+        self._count += 1
+        self._dde_count += 1
+        self.stats.requests += 1
+        item.attempts += 1
+        if r is None:
+            self.dde_not_attempted += 1
+            return
+        self.on_readings([r])
+        self.dde_last[metric] = {
+            "value": r.value,
+            "text": r.text,
+            "unit": r.unit,
+            "quality": r.quality,
+            "status": r.status,
+            "detail": r.detail,
+            "t_wall": r.t_wall,
+            "t_mono": r.t_mono,
+        }
+        if r.quality in GOOD:
+            item.ok += 1
+            if r.value is not None:
+                self.last[f"dde:{metric}"] = _Last(r.value, r.t_wall, r.t_mono)
+            if (
+                self._dde_semantics.get(metric) == "regeneration_active_flag"
+                and r.quality == "ok"
+                and r.status
+            ):
+                self._dde_regen_transition(metric, r)
+        elif r.quality == "disconnected":
+            self._link_lost(r)
+
+    def _regen_item(self) -> _Item | None:
+        return next(
+            (
+                i
+                for i in self.items
+                if i.kind == "dde" and self._dde_semantics.get(i.metric or "") == "regeneration_active_flag"
+            ),
+            None,
+        )
+
+    def regen_window_s(self) -> float:
+        """Freshness window of the regeneration flag: a multiple of its EFFECTIVE scheduler interval
+        (tier stretch x DDE stretch), the same rule the session analysis applies to attempted reads."""
+        from app.diagnostics.dde import REGEN_STALE_FACTOR, REGEN_STALE_MIN_S
+
+        item = self._regen_item()
+        iv = self.interval(item) if item is not None else REGEN_STALE_MIN_S
+        return max(REGEN_STALE_FACTOR * iv, REGEN_STALE_MIN_S)
+
+    def _dde_synthetic(self) -> bool:
+        return bool(self.dde and self.dde.runtime.ctx.synthetic_session)
+
+    def _dde_regen_transition(self, metric: str, r: Reading) -> None:
+        """A decoded flag reading. Events only for transitions between two KNOWN states; a reading after
+        an unknown period re-confirms the state without claiming when it started."""
+        active = bool((r.status or {}).get("active"))
+        prev = self.dde_regen
+        self.dde_regen = {"active": active, "t_wall": r.t_wall, "t_mono": r.t_mono, "known": True}
+        evidence = {
+            "signal_key": metric,
+            "request_id": r.request_id,
+            "catalog_version": r.catalog_version,
+            "decoder_version": r.decoder_version,
+            "raw_hex": r.raw_hex,
+            "synthetic": self._dde_synthetic(),
+        }
+        tag = ", SYNTHETIC simulator" if self._dde_synthetic() else ""
+        if prev is None or not prev.get("known"):
+            if active:
+                self.dde_regen_events += 1
+                self._event(
+                    "dde_regeneration_confirmed",
+                    f"DPF regeneration flag ACTIVE as reported by the DDE (measured manufacturer value{tag}). "
+                    + ("First decoded reading of this recording" if prev is None else "First fresh reading after an "
+                       "unknown period")
+                    + (" (also active before it, so it may have continued through it)"
+                       if prev is not None and prev.get("active") else "")
+                    + ": when it started is not known.",
+                    {
+                        **evidence,
+                        "after_unknown_period": prev is not None,
+                        "state_before_unknown_period": (
+                            None if prev is None else ("active" if prev.get("active") else "inactive")
+                        ),
+                    },
+                    at=(r.t_wall, r.t_mono),
+                )  # fmt: skip
+            return
+        if prev["active"] == active:
+            return
+        self.dde_regen_events += 1
+        self._event(
+            "dde_regeneration_started" if active else "dde_regeneration_ended",
+            f"DPF regeneration flag changed, as reported by the DDE (measured manufacturer value{tag}). The change "
+            f"happened between the previous fresh reading ({r.t_mono - prev['t_mono']:.1f} s earlier) and this one.",
+            {**evidence, "previous_reading_age_s": round(r.t_mono - prev["t_mono"], 2)},
+            at=(r.t_wall, r.t_mono),
+        )
+
+    def _dde_regen_expire(self, reason: str | None = None) -> None:
+        """The last flag reading is no longer fresh (too old, ECU silent, adapter lost): the state becomes
+        UNKNOWN - never 'inactive'. An active state that expires is recorded as such."""
+        reg = self.dde_regen
+        if reg is None or not reg.get("known"):
+            return
+        now = self.clock.monotonic()
+        if reason is None:
+            if now - reg["t_mono"] <= self.regen_window_s():
+                return
+            reason = "no fresh regeneration-flag reading"
+        reg["known"] = False
+        if reg["active"]:
+            self.dde_regen_events += 1
+            self._event(
+                "dde_regeneration_unknown",
+                f"DPF regeneration state is now UNKNOWN ({reason}); it was last confirmed active "
+                f"{now - reg['t_mono']:.0f} s ago. Not interpreted as ended.",
+                {"reason": reason, "last_confirmed_wall": reg["t_wall"], "synthetic": self._dde_synthetic()},
+            )
+        self._publish()
+
+    def dde_snapshot(self) -> dict[str, Any] | None:
+        if self.dde is None:
+            return None
+        now = self.clock.monotonic()
+        signals = {}
+        for i in self.items:
+            if i.kind != "dde":
+                continue
+            last = self.dde_last.get(i.metric or "")
+            iv = self.interval(i)
+            age = round(now - last["t_mono"], 2) if last else None
+            fresh_s = max(3 * iv, 10.0)
+            signals[i.metric] = {
+                "t_wall": last["t_wall"] if last else None,
+                "fresh_until_wall": round(last["t_wall"] + fresh_s, 3) if last else None,
+                "title": i.title,
+                "tier": i.tier,
+                "interval_s": round(iv, 3),
+                "value": last["value"] if last else None,
+                "text": last["text"] if last else None,
+                "unit": last["unit"] if last else None,
+                "quality": last["quality"] if last else None,
+                "detail": last["detail"] if last else None,
+                "age_s": age,
+                "stale": age is None or age > max(3 * iv, 10.0),
+                "suspended": not self.dde.due(i.metric or ""),
+            }
+        reg = self.dde_regen
+        window = self.regen_window_s()
+        fresh = bool(reg and reg.get("known") and self.state == "running" and now - reg["t_mono"] <= window)
+        regen = ("active" if reg["active"] else "inactive") if fresh and reg else "unknown"
+        return {
+            "enabled": True,
+            "synthetic": self.dde.runtime.ctx.synthetic_session,
+            "catalog_version": self.dde.runtime.catalog.version,
+            "unsupported_adapter": self.dde.runtime.unsupported,
+            "scale": round(self.dde_scale, 3),
+            "signals": signals,
+            # unknown when stale or never read - never "inactive" by default
+            "regeneration": {
+                "state": regen,
+                "source": "bmw_dde" if reg else None,
+                "measured_at_wall": reg["t_wall"] if reg else None,
+                # the frontend turns the state into 'unknown' after this instant, also without new events
+                "fresh_until_wall": round(reg["t_wall"] + window, 3) if reg and fresh else None,
+                "freshness_window_s": round(window, 2),
+            },
+            "scheduling": dict(self._dde_status),
+        }
+
     # -- bookkeeping per reading ----------------------------------------------------------
     def _primary(self, r: Reading) -> bool:
         return r.ecu is None or self.primary_ecu is None or r.ecu == self.primary_ecu
@@ -324,7 +548,7 @@ class MonitoringRecorder:
         self.stats.requests += 1
         item.attempts += 1
         self.on_readings(rs)
-        if item.pid is None:
+        if item.kind == "adapter":
             self._absorb_adapter(rs[0])
             return
         good = [r for r in rs if r.quality in GOOD]
@@ -509,46 +733,122 @@ class MonitoringRecorder:
 
     # -- scheduling ------------------------------------------------------------------------
     def _adapt(self) -> None:
+        """Every adaptation window: generic OBD first, DDE gets what is left.
+
+        * Generic capacity is measured from generic requests only (an expensive DDE transaction never
+          makes the generic link look slower), and the generic tiers are scaled against the full load
+          budget exactly as without DDE - DDE never stretches the generic fast tier.
+        * DDE demand uses the measured time of one DDE transaction (set-up + request + restore) and the
+          EFFECTIVE DDE intervals. Its share of wall-clock link time is aimed at DDE_TARGET_SHARE (or
+          less, if the generic tiers need more of the budget) by stretching DDE intervals, up to
+          DDE_MAX_SCALE. If even that is not enough the target is recorded as exceeded: it is a target,
+          not a hard limit.
+        """
         now = self.clock.monotonic()
         if now - self._window_start < ADAPT_EVERY_S or self._count < 5 or self._busy <= 0:
             return
-        capacity = self._count / self._busy  # requests per second the link actually delivered
+        capacity = self._count / self._busy  # requests per second, all requests (reported as before)
         self._capacity = capacity
+        gen_count, gen_busy = self._count - self._dde_count, self._busy - self._dde_busy
+        cap_g = gen_count / gen_busy if gen_count >= 3 and gen_busy > 0 else capacity
+        if self._dde_count:
+            tx = self._dde_busy / self._dde_count
+            self._dde_tx_s = tx if self._dde_tx_s is None else 0.5 * self._dde_tx_s + 0.5 * tx
+        # every *_share in the scheduling status is a share of WALL-CLOCK time (busy link-seconds per
+        # second of the adaptation window), like target / allowed / projected; the DDE share of the
+        # link's busy time only is a different quantity and is reported as busy_time_share
+        window_s = now - self._window_start
+        measured_dde_share = self._dde_busy / window_s
+        dde_busy_time_share = self._dde_busy / self._busy
         self._window_start, self._busy, self._count = now, 0.0, 0
-        active = [i for i in self.items if i.suspended_until is None]
-        d_fast = sum(1 / i.base_s for i in active if i.tier == "fast")
-        d_low = sum(1 / i.base_s for i in active if i.tier != "fast")
-        budget = LOAD_BUDGET * capacity
+        self._dde_busy, self._dde_count = 0.0, 0
+
+        generic = [i for i in self.items if i.kind != "dde" and i.suspended_until is None]
+        d_fast = sum(1 / i.base_s for i in generic if i.tier == "fast")
+        d_low = sum(1 / i.base_s for i in generic if i.tier != "fast")
+        budget = LOAD_BUDGET * cap_g
         if d_fast + d_low <= budget:
             fast, low = 1.0, 1.0
         elif d_fast + d_low / MAX_LOW_TIER_STRETCH <= budget:
             fast, low = 1.0, d_low / (budget - d_fast)
         else:
-            s = (d_fast + d_low / MAX_LOW_TIER_STRETCH) / budget
-            fast, low = s, MAX_LOW_TIER_STRETCH * s
+            s_ = (d_fast + d_low / MAX_LOW_TIER_STRETCH) / budget
+            fast, low = s_, MAX_LOW_TIER_STRETCH * s_
         old = dict(self.scale)
+        old_dde = self.dde_scale
         self.scale = {"fast": round(fast, 3), "low": round(low, 3)}
+        gen_share = (d_fast / fast + d_low / low) / cap_g if cap_g > 0 else 1.0
+
+        dde_items = [
+            i for i in self.items if i.kind == "dde" and self.dde is not None and self.dde.due(i.metric or "")
+        ]
+        allowed = max(0.0, min(DDE_TARGET_SHARE, LOAD_BUDGET - gen_share))
+        exceeded = False
+        projected = 0.0
+        if dde_items and self._dde_tx_s:
+            # link-time share of DDE at dde_scale 1 with the current (generic-driven) low-tier stretch
+            share_at_1 = sum(1 / (i.base_s * self.scale["low"]) for i in dde_items) * self._dde_tx_s
+            need = share_at_1 / allowed if allowed > 0 else float("inf")
+            self.dde_scale = round(min(DDE_MAX_SCALE, max(1.0, need)), 3)
+            exceeded = need > DDE_MAX_SCALE
+            projected = share_at_1 / self.dde_scale
+        self._dde_status = {
+            "target_share": DDE_TARGET_SHARE,
+            "allowed_share": round(allowed, 3),
+            "projected_share": round(projected, 3),
+            "measured_share": round(measured_dde_share, 3),
+            "busy_time_share": round(dde_busy_time_share, 3),
+            "window_s": round(window_s, 2),
+            "transaction_s": round(self._dde_tx_s, 3) if self._dde_tx_s else None,
+            "target_exceeded": exceeded,
+        }
         changed = any(abs(self.scale[k] - old[k]) > 0.1 * old[k] for k in old)
+        changed = changed or abs(self.dde_scale - old_dde) > 0.1 * old_dde or exceeded
         if changed:
-            self.stats.adjustments.append(
-                {
-                    "t_wall": self.clock.wall(),
-                    "t_rel_s": round(now - self.started_mono, 2),
-                    "capacity_rps": round(capacity, 2),
-                    "demand_rps_at_base": round(d_fast + d_low, 2),
-                    "scale": dict(self.scale),
-                    "effective_intervals": self.effective_intervals(),
-                }
-            )
+            adj: dict[str, Any] = {
+                "t_wall": self.clock.wall(),
+                "t_rel_s": round(now - self.started_mono, 2),
+                "capacity_rps": round(capacity, 2),
+                "generic_capacity_rps": round(cap_g, 2),
+                "demand_rps_at_base": round(d_fast + d_low, 2),
+                "scale": dict(self.scale),
+                "effective_intervals": self.effective_intervals(),
+            }
+            if self.dde is not None:
+                adj.update(
+                    dde_scale=self.dde_scale,
+                    dde_share=round(measured_dde_share, 3),  # wall-clock, = dde.measured_share
+                    dde=dict(self._dde_status),
+                    dde_effective_intervals={
+                        i.metric: round(self.interval(i), 3) for i in self.items if i.kind == "dde"
+                    },
+                )
+            self.stats.adjustments.append(adj)
             del self.stats.adjustments[:-MAX_ADJUSTMENTS_KEPT]
         self._publish()
 
     def _due(self) -> _Item | None:
+        """Earliest deadline first; among items already due, generic OBD goes before DDE (a DDE
+        transaction is deferred, never a generic read)."""
         now = self.clock.monotonic()
         cands = [i for i in self.items if i.suspended_until is None or i.suspended_until <= now]
         if not cands:
             return None
+        due_now = [i for i in cands if i.next_due <= now]
+        if due_now:
+            return min(due_now, key=lambda i: (i.kind == "dde", i.next_due, TIERS.index(i.tier)))
         return min(cands, key=lambda i: (i.next_due, TIERS.index(i.tier)))
+
+    def _reschedule_after_restore(self) -> None:
+        """After a reconnect / ECU restore: generic items at once, DDE items spread over their next
+        effective interval - no burst of catch-up manufacturer transactions."""
+        now = self.clock.monotonic()
+        dde = [i for i in self.items if i.kind == "dde"]
+        for i in self.items:
+            if i.kind != "dde":
+                i.next_due = now
+        for k, i in enumerate(dde, start=1):
+            i.next_due = now + self.interval(i) * k / len(dde)
 
     def _step_running(self) -> None:
         self.resume.clear()  # "resume ECU polling" means nothing while polling runs
@@ -565,7 +865,11 @@ class MonitoringRecorder:
             item.suspended_until = None  # one retry; re-suspended (longer) if it still fails
         t0 = self.clock.monotonic()
         try:
-            if item.pid is None:
+            if item.kind == "dde":
+                self._read_dde(item, t0)
+                self._adapt()
+                return
+            if item.kind == "adapter":
                 r = self._read_adapter(allow_reinit=True)
                 if r is not None:
                     self._absorb(item, [r], t0)
@@ -594,15 +898,14 @@ class MonitoringRecorder:
         if not self._live():
             return
         self._backoff = min(BACKOFF_S[1], self._backoff * 2)
-        first = next(i for i in self.items if i.pid is not None)
+        first = next(i for i in self.items if i.kind == "obd")
         t0 = self.clock.monotonic()
         try:
             rs = self._read_pid(first.pid)  # type: ignore[arg-type]
         except TransportError:
             return
         self._set_state("running")
-        for i in self.items:
-            i.next_due = self.clock.monotonic()
+        self._reschedule_after_restore()
         self._absorb(first, rs, t0)
 
     def _read_adapter_paused(self) -> Reading | None:
@@ -633,7 +936,7 @@ class MonitoringRecorder:
 
     def _step_ecu_lost(self) -> None:
         now = self.clock.monotonic()
-        volt = next((i for i in self.items if i.pid is None), None)
+        volt = next((i for i in self.items if i.kind == "adapter"), None)
         if self.resume.is_set():
             self.resume.clear()
             self._probe_ecu(manual=True)
@@ -669,7 +972,7 @@ class MonitoringRecorder:
         if not self._live():
             return
         self._backoff = min(BACKOFF_S[1], self._backoff * 2)
-        volt = next((i for i in self.items if i.pid is None), None)
+        volt = next((i for i in self.items if i.kind == "adapter"), None)
         t0 = self.clock.monotonic()
         r = self._read_adapter_paused()
         if r is None or r.quality in ("disconnected", "timeout"):
@@ -685,7 +988,7 @@ class MonitoringRecorder:
     def _probe_ecu(self, manual: bool) -> None:
         """One vehicle request to see whether the ECU answers again (user-requested or opt-in)."""
         self.stats.ecu_probes += 1
-        first = next(i for i in self.items if i.pid is not None)
+        first = next(i for i in self.items if i.kind == "obd")
         t0 = self.clock.monotonic()
         try:
             rs = self._read_pid(first.pid)  # type: ignore[arg-type]
@@ -727,8 +1030,8 @@ class MonitoringRecorder:
             )
             self._last_vehicle_ok = self.clock.monotonic()
             self._link_ok(good[0])
+            self._reschedule_after_restore()
             for i in self.items:
-                i.next_due = self.clock.monotonic()
                 i.fails, i.suspended_until, i.suspend_s = 0, None, 0.0
             self.stats.suspended.clear()
             self._set_state("running")
@@ -749,6 +1052,8 @@ class MonitoringRecorder:
     def run(self) -> None:
         self._publish()
         while self._live():
+            if self.dde is not None:
+                self._dde_regen_expire()
             if self.state == "running":
                 self._step_running()
             elif self.state == "ecu_unresponsive":
@@ -794,9 +1099,28 @@ class MonitoringRecorder:
                     "final_interval_s": round(self.interval(i), 3),
                     "attempts": i.attempts,
                     "ok": i.ok,
+                    "kind": i.kind,
+                    "metric": i.metric,
                 }
                 for i in self.items
             ],
+            "dde": None
+            if self.dde is None
+            else {
+                "plan": self.dde_plan,
+                "final_scale": round(self.dde_scale, 3),
+                "scheduling": dict(self._dde_status),
+                "final_effective_intervals": {
+                    i.metric: round(self.interval(i), 3) for i in self.items if i.kind == "dde"
+                },
+                "not_attempted": self.dde_not_attempted,
+                "regeneration_flag_changes": self.dde_regen_events,
+                "availability": self.dde.availability(),
+                "results": dict(self.dde.runtime.counts),
+                "unsupported_adapter": self.dde.runtime.unsupported,
+                "transactions": self.client.transport.describe().get("manufacturer_transactions"),
+                "restore_failures": self.client.transport.describe().get("manufacturer_restore_failures"),
+            },
             # What this session actually demonstrated (never assumed): post-shutdown observability
             "observed_capabilities": {
                 "engine_stops_observed": st.engine_stops_observed,

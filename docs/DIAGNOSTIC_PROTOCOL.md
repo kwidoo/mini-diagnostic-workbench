@@ -147,6 +147,52 @@ with large |error| and windows around user annotations, so +/- deviations cannot
 It needs at least 20 samples over 10 s; sampling below 1 Hz is reported as a limitation.
 The 15 % level is a screening heuristic of this tool, not a vehicle-specific threshold.
 
-## Manufacturer-specific requests
+## Manufacturer-specific requests (DDE-03 guarded path)
 
-None exist in this codebase. See OBD_SUPPORT_MATRIX.md for what adding one requires.
+No manufacturer request is executable for the real car today: the BMW catalog
+(DDE_REQUEST_CATALOG.md) has no verified entry. The path below exists so that a verified
+entry, once it exists, can run safely. It is exercised against the simulator with
+invented addressing only.
+
+- **No raw API.** The generic allowlist (`AllowedCommand`) is unchanged: it still
+  rejects every manufacturer service and every addressing AT command. A manufacturer
+  request is an `ApprovedRequest`, and only `guarded.approve()` creates one, from an
+  entry the catalog gate calls executable (opt-in, vehicle verification, variant,
+  decoder, DDE-01 verdict) on an adapter that reports ISO 15765-4 CAN 11/500.
+  `GuardedCommand` validates itself: exact patterns for `AT SH hhh`, `AT CEA [hh]`,
+  `AT CRA [hhh]`, `AT FC SH hhh`, `AT FC SD ..`, `AT FC SM n`, and read-only services for
+  the payload.
+- **One transaction, one lock hold.** `Transport.send_manufacturer` sends set-up, request
+  and restore without releasing the transport lock, so no generic request can run in
+  between. One request is outstanding at a time across generic and manufacturer reads.
+- **Set-up:** `AT SH <tx>`, `AT CEA <ext>` (extended addressing only), `AT CRA <rx>`
+  (receive filter: only the addressed ECU's frames), `AT FC SH / SD / SM` (when the entry
+  documents flow control). Each must answer exactly `OK`, otherwise the request is not sent.
+  A `?` means the adapter cannot do it: the result is `unsupported_adapter`, and no
+  further manufacturer request is sent on that connection (no retry, no probing).
+- **Restore to the generic baseline:** `AT SH 7DF`, `AT CEA`, `AT CRA`, `AT FC SM 0`,
+  always, each checked for `OK`. If restoring fails, or the request timed out / the link
+  dropped / desynchronised, the connection is invalidated. The next request of any kind
+  re-opens it and re-initialises the adapter from `ATZ`, which resets every ELM setting.
+  Addressing can never leak into generic OBD or into another profile or session.
+- **No re-initialisation for a DDE read.** `ObdClient.manufacturer_exchange` sends only
+  on an already initialised connection. Otherwise the read is `not_attempted`. Generic
+  polling re-initialises under the existing rules; a manufacturer read never wakes a link
+  by itself.
+- **Decoding (assumption A3, to verify on the car):** with `ATH1` and `AT CEA`, each
+  received frame is printed as `<rx id> <ext> <PCI> <data>`. Every frame must come from
+  the entry's response id with the expected extended address, otherwise the whole reply is
+  untrusted (`error`). ISO-TP reassembly is the same strict per-ECU reassembly as above.
+  The positive SID and echoed identifier, the length bounds and the documented range are
+  checked by the catalog before a decoder runs.
+- **Result qualities:** `ok` (value from a verified decoder), `raw_only`, `no_data`,
+  `negative` (NRC kept), `timeout`, `disconnected`, `error` (framing / foreign frames /
+  incomplete ISO-TP / layout), `unsupported_adapter`, `not_attempted` (gate or link). Only
+  `ok` carries a value.
+
+Controls: `mini-obd dde-settings --opt-in --variant <confirmed>` (or `--opt-out`,
+`--clear-variant`), `PUT /api/dde/settings`, and the Vehicle tab ("Manufacturer reads").
+The default is opted out with no variant. `mini-obd dde-settings` shows, per metric, why
+it is blocked. Tests: `backend/tests/test_dde_transport.py` (fake ELM over TCP: exact
+transactions, restore, NRC, NO DATA, partial ISO-TP, foreign frames, timeout, drop,
+restore failure, unsupported adapter, mixed generic/DDE polling from two threads).

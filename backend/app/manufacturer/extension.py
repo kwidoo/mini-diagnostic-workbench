@@ -65,6 +65,10 @@ class ManufacturerExtension:
             for p in self.ecu.manufacturer_parameters
         ]
 
+    def catalog_summary(self) -> dict[str, object] | None:
+        """Request-catalog availability (BMW DDE only), with no opt-in / no confirmed variant."""
+        return None
+
     def read(self, key: str) -> None:
         raise ExtensionUnavailableError(
             f"{self.id}: parameter {key!r} is unavailable: no verified, allowlisted read request exists."
@@ -74,6 +78,21 @@ class ManufacturerExtension:
 class BmwDdeExtension(ManufacturerExtension):
     id = "bmw-dde"
     ecu_definition_id = "bmw-dde-unconfirmed"
+
+    def catalog_summary(self) -> dict[str, object] | None:
+        from app.manufacturer.bmw.catalog import ExecutionContext, default_catalog
+
+        cat = default_catalog()
+        return {
+            "version": cat.version,
+            "metrics": [
+                {
+                    k: a.get(k)
+                    for k in ("metric", "title", "priority", "kind", "status", "reasons", "establish_by")
+                }
+                for a in cat.availability(ExecutionContext())
+            ],
+        }
 
 
 class PorscheMe78Extension(ManufacturerExtension):
@@ -122,6 +141,7 @@ class ExtensionRegistry:
                     "requests": [c.text for c in ext.allowlisted_requests()],
                     "access_requirements": ext.ecu.access_requirements,
                     "parameters": ext.parameters(),
+                    "catalog": ext.catalog_summary(),
                 }
             )
         return out

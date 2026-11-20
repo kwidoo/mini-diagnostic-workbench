@@ -19,16 +19,33 @@ service or data identifiers.
 | Transports | Only accept `AllowedCommand` objects. Passing a string raises. |
 | Client | `ObdClient` has no method that takes a free-form command. |
 | Service, API, CLI, UI | No raw console, no endpoint or command that forwards adapter text. Tests assert this for the route table and the UI controls. |
-| Manufacturer extensions | Off. An extension can only declare requests that already pass the allowlist, which today admits no manufacturer request. |
+| Manufacturer extensions | Off. An extension can only declare requests that already pass the allowlist, which admits no manufacturer request. |
+| BMW DDE guarded path (DDE-03) | Separate, typed path: only `ApprovedRequest` objects built by `guarded.approve()` from a catalog entry that passes every gate (enabled, complete, pure read, vehicle-verified, user opt-in, confirmed variant, decoder version, DDE-01 candidate verdict). No entry passes today. Exact patterns for the six addressing AT commands; read-only services only; set-up / request / restore under one transport lock; failed restore invalidates the connection (re-init from ATZ). |
 | Tests | `tests/test_allowlist.py` runs scan + inventory + recording against the simulator and checks every command the fake adapter ever received. |
 
 `ATZ` resets the adapter, not the car. `ATSP0` asks the adapter to auto-detect the
 protocol; on K-line vehicles that involves the normal OBD bus initialisation.
 
+## DDE capability check
+
+`mini-obd dde-capability` / Vehicle -> "Run capability check" sends only requests that
+were already allowed: service 09 InfoTypes 04 (calibration ID), 06 (CVN) and 0A (ECU
+name), plus 02 (VIN) with explicit consent. It adds no request type and no adapter
+command. The report counts any request outside the allowlist found in the session
+trace (must be 0). Details: DDE_CAPABILITY.md.
+
+## BMW DDE fault memory (DDE-04)
+
+Read only with a scan or the pre / post scans of a recording, through the guarded DDE path,
+and only when a verified catalog entry passes every gate. Today none does, so nothing is
+sent and the scan records `unavailable`. Nothing is ever cleared. See DDE_FAULTS.md.
+
 ## Continuous monitoring
 
-- No new request type: monitoring uses the same allowlisted generic OBD reads plus the
-  adapter-only `ATRV`. No DPF regeneration, fan activation, DTC clearing or adaptation
+- No new generic request type: monitoring uses the same allowlisted generic OBD reads plus
+  the adapter-only `ATRV`. BMW DDE reads are added only through the guarded DDE path
+  (DDE-03/06), only while the ECU answers, never after ECU silence or an adapter-only
+  reconnect, with a bounded share of link time. Today no real DDE request is executable. No DPF regeneration, fan activation, DTC clearing or adaptation
   reset is possible, and no BMW-specific request exists.
 - When the ECU stops answering (typically ignition off) the recorder sends no vehicle
   requests; it does not try to wake modules. Only the adapter voltage (`ATRV`, adapter-local)

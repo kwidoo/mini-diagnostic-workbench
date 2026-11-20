@@ -163,6 +163,9 @@ class EcuMessage:
     payload: bytes
     complete: bool = True
     problem: str | None = None
+    #: True when this message started with an ISO-TP first frame (multi-frame transfer). Only such a
+    #: message, when complete, is evidence that multi-frame reception (adapter flow control) worked.
+    multi_frame: bool = False
 
     @property
     def is_negative(self) -> bool:
@@ -200,10 +203,10 @@ def assemble_isotp(frames: list[CanFrame]) -> list[EcuMessage]:
             if fr.ecu in open_msgs:
                 close_incomplete(fr.ecu, "new first frame before previous message finished")
             if len(fr.data) < 2:
-                messages.append(EcuMessage(fr.ecu, b"", False, "truncated first frame"))
+                messages.append(EcuMessage(fr.ecu, b"", False, "truncated first frame", multi_frame=True))
                 continue
             total = ((fr.data[0] & 0x0F) << 8) | fr.data[1]
-            msg = EcuMessage(ecu=fr.ecu, payload=bytes(fr.data[2:]))
+            msg = EcuMessage(ecu=fr.ecu, payload=bytes(fr.data[2:]), multi_frame=True)
             messages.append(msg)
             open_msgs[fr.ecu] = (msg, total, 1)
         elif pci == 0x2:  # consecutive frame

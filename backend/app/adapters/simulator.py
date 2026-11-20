@@ -15,11 +15,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from app.adapters.base import Transport, VirtualClock
+from app.adapters.base import Transport, TransportError, VirtualClock
 from app.parameters.standard_pids import BITMAP_PIDS, encode_dtc
 
 SYNTHETIC_VIN = "SYNTHETICVIN00001"
 SYNTHETIC_CAL = "SYNTHETIC-CAL-01"
+SYNTHETIC_CVN = bytes.fromhex("5EC0FFEE")
+SYNTHETIC_ECU_NAME = b"ECM\x00-SyntheticEngi\x00\x00"  # 20 bytes, SAE J1979 layout (invented text)
 
 
 def _clamp(v: float, lo: int, hi: int) -> int:
@@ -56,6 +58,21 @@ def encode_pid(pid: int, value: float) -> bytes:
 
 
 @dataclass(frozen=True)
+class SimDde:
+    """SYNTHETIC manufacturer-addressed ECU behind the fake adapter (DDE-03 tests only).
+
+    Answers only when the adapter is set to exactly this addressing (AT SH / AT CEA, receive
+    filter unset or matching). ``responses(t, request_hex)`` returns the response payload (SID
+    first; a 7F.. negative is allowed) or None for no answer. Ids and layouts are invented."""
+
+    tx_can_id: str
+    rx_can_id: str
+    responses: Callable[[float, str], bytes | None]
+    tx_ext: str | None = None
+    rx_ext: str | None = None
+
+
+@dataclass(frozen=True)
 class Scenario:
     name: str
     description: str
@@ -83,6 +100,14 @@ class Scenario:
     ecu_online: Callable[[float], bool] | None = None
     # t -> adapter supply voltage for ATRV (None: constant 14.1 V). Adapter-local, works with the ECU asleep.
     adapter_voltage: Callable[[float], float] | None = None
+    # what the fake adapter claims about itself (ATZ / ATI / AT@1); clones print anything
+    adapter_identity: str = "ELM327 v2.3"
+    adapter_description: str = "SYNTHETIC ELM327 SIMULATOR"
+    # synthetic manufacturer-addressed ECU; None: the adapter rejects addressing commands with '?'
+    dde: SimDde | None = None
+    # (t_from, t_to) windows of a simulated Wi-Fi outage (in-process transport only): the adapter
+    # connection drops and cannot be re-opened until the window ends
+    link_drops: tuple[tuple[float, float], ...] = ()
 
 
 # -- synthetic signal generators ------------------------------------------------
@@ -312,6 +337,57 @@ IGNITION_OFF = DriveCycle((("ign", 5), ("idle", 60), ("ign", 20), ("off", 1200))
 ECU_SILENT = DriveCycle((("ign", 5), ("idle", 60), ("off", 1200)), coolant_start_c=80.0)
 
 
+# -- SYNTHETIC manufacturer ECU (DDE-03..06 tests) ------------------------------------------
+# Invented addressing and identifiers matching app/manufacturer/bmw/synthetic.py. They do not
+# describe any BMW / MINI ECU.
+SYN_DDE_IDENT = b"SYNTHETIC-DDE-0 SW 0001"
+
+
+def _dde_responses(cycle: DriveCycle, faults: tuple[tuple[str, int], ...] = ()):
+    """request hex -> synthetic response payload, following the drive cycle's phases."""
+
+    def u16(v: float, scale: float) -> bytes:
+        return _clamp(v / scale, 0, 0xFFFF).to_bytes(2, "big")
+
+    def fn(t: float, req: str) -> bytes | None:
+        ph, into, run = cycle.phase_at(t)
+        running = ph not in ("ign", "off")
+        regen = ph == "regen"
+        sig = cycle.signals(t, random.Random(int(t * 7)))
+        soot = 18.0 + run / 600.0 - (into / 60.0 if regen else 0.0)
+        values: dict[str, bytes] = {
+            "22F100": SYN_DDE_IDENT,
+            "22F101": b"\x01" if regen else b"\x00",
+            "22F102": u16(max(0.0, soot), 0.01),
+            "22F103": u16((25.0 + sig[0x10] * 0.8) if running else 0.0, 0.1),
+            "22F104": u16((600.0 if regen else 240.0 + sig[0x04]) if running else sig[0x46] + 20, 0.1),
+            "22F105": u16(sig[0x2C], 0.1),
+            "22F106": u16(max(0.0, sig[0x2C] - 1.5), 0.1),
+            "22F107": u16(420.0 if running else 0.0, 0.1),
+            "22F108": u16(sig[0x10] * 41.0 if running else 0.0, 0.1),
+        }
+        if req == "18" + "02FFFF":
+            body = b"".join(bytes.fromhex(code) + bytes([st]) for code, st in faults)
+            return bytes([0x58, len(faults)]) + body
+        if req in values:
+            return bytes.fromhex("62" + req[2:]) + values[req]
+        return bytes([0x7F, int(req[:2], 16), 0x31])  # requestOutOfRange
+
+    return fn
+
+
+def _syn_dde(cycle: DriveCycle, faults: tuple[tuple[str, int], ...] = ()) -> SimDde:
+    return SimDde("7B0", "7B8", _dde_responses(cycle, faults), tx_ext="5A", rx_ext="F5")
+
+
+# DDE-06 combined synthetic drive (~23 min): warm-up idle, city, idle, regeneration-like phase,
+# city with a Wi-Fi outage, idle, engine stop, ECU silence.
+DDE_DRIVE = DriveCycle(
+    (("ign", 8), ("idle", 60), ("city", 300), ("idle", 120), ("regen", 240), ("city", 300), ("idle", 30),
+     ("ign", 30), ("off", 300)),
+    coolant_start_c=20.0,
+)  # fmt: skip
+
 MINI = "mini-countryman-r60-diesel"
 PORSCHE = "porsche-boxster-986-mk2"
 
@@ -365,6 +441,25 @@ SCENARIOS: dict[str, Scenario] = {
         Scenario("mini_ecu_silent_running", "Synthetic: the ECU stops answering while the engine was running",
                  MINI, **_drive(ECU_SILENT)),
         Scenario(
+            "mini_dde_capability",
+            "Synthetic DDE capability check: service 09 calibration ID / CVN / ECU name answered multi-frame",
+            MINI, _diesel(), stored=("P115D",), mil=True, mode09=(0x02, 0x04, 0x06, 0x0A),
+        ),
+        Scenario(
+            "mini_dde_synthetic",
+            "Synthetic warm idle + regeneration-like phase with a SYNTHETIC manufacturer-addressed ECU "
+            "(invented ids / layouts; exercises the gated DDE path only)",
+            MINI, stored=("P115D",), mil=True, raw_only_pids=(0x7A, 0x7C, 0x78),
+            dde=_syn_dde(REGEN, (("4862", 0x24), ("480A", 0x08))), **_drive(REGEN),
+        ),
+        Scenario(
+            "mini_dde_drive",
+            "Synthetic ~23 min drive with a SYNTHETIC manufacturer ECU: regeneration-like phase, Wi-Fi outage, "
+            "engine stop and ECU silence (invented ids / layouts)",
+            MINI, stored=("P115D",), mil=True, raw_only_pids=(0x7A, 0x7C, 0x78),
+            dde=_syn_dde(DDE_DRIVE, (("4862", 0x24),)), link_drops=((700.0, 730.0),), **_drive(DDE_DRIVE),
+        ),
+        Scenario(
             "porsche_healthy_idle", "Synthetic petrol flat-six idle over K-line (ISO 9141-2)", PORSCHE,
             _petrol_flat6(), family="kline", protocol_number="3", protocol_name="ISO 9141-2",
             compression_ignition=False, mode0a=False, mode06="no_data", second_ecu=False, delay=(0.08, 0.14),
@@ -400,12 +495,21 @@ class ElmSimulator:
         self.rng = random.Random(self.seed)
         self.received: list[str] = []  # every command ever received (tests inspect this)
         self.dtcs_cleared = False  # set if a (forbidden) service 04 ever arrives
+        self.obd_log: list[tuple[str, str | None, str | None, str | None]] = []  # (request, header, cea, cra)
+        self.manufacturer_requests: list[str] = []  # requests answered by the synthetic manufacturer ECU
         self.t0 = self.clock.monotonic()  # type: ignore[attr-defined]
         self._reset()
 
     def _reset(self) -> None:
         self.echo, self.linefeed, self.spaces, self.headers = True, False, True, False
         self.searched = False
+        # manufacturer addressing state (ELM defaults after ATZ): functional header, no CEA / CRA
+        self.header: str | None = None
+        self.cea: str | None = None
+        self.cra: str | None = None
+        self.fc_mode = 0
+        self.fc_header: str | None = None
+        self.fc_data: str | None = None
 
     # -- public -----------------------------------------------------------------
     def handle(self, command: str) -> tuple[bytes, float]:
@@ -425,7 +529,7 @@ class ElmSimulator:
         eol = "\r\n" if self.linefeed else "\r"
         out = (command + eol if self.echo and cmd != "ATZ" else "") + eol.join(lines) + eol + eol + ">"
         if cmd == "ATZ":
-            out = eol + eol + "ELM327 v2.3" + eol + eol + ">"
+            out = eol + eol + self.scenario.adapter_identity + eol + eol + ">"
         return out.encode("latin-1"), delay
 
     # -- AT -------------------------------------------------------------------
@@ -433,11 +537,11 @@ class ElmSimulator:
         sc = self.scenario
         if cmd == "ATZ":
             self._reset()
-            return ["ELM327 v2.3"]
+            return [sc.adapter_identity]
         if cmd == "ATI":
-            return ["ELM327 v2.3"]
+            return [sc.adapter_identity]
         if cmd == "AT@1":
-            return ["SYNTHETIC ELM327 SIMULATOR"]
+            return [sc.adapter_description]
         if cmd in ("ATE0", "ATE1"):
             self.echo = cmd.endswith("1")
         elif cmd in ("ATL0", "ATL1"):
@@ -447,6 +551,8 @@ class ElmSimulator:
         elif cmd in ("ATH0", "ATH1"):
             self.headers = cmd.endswith("1")
         elif cmd in ("ATSP0", "ATAT1"):
+            pass
+        elif sc.dde is not None and self._addressing(cmd):
             pass
         elif cmd == "ATDP":
             return ["AUTO, " + sc.protocol_name]
@@ -481,6 +587,11 @@ class ElmSimulator:
         mode, args = body[0], body[1:]
         if sc.ecu_online is not None and not sc.ecu_online(self._t()):
             return ["NO DATA"]  # ignition off / ECU asleep: nothing on the bus answers
+        self.obd_log.append((cmd, self.header, self.cea, self.cra))
+        if self.header not in (None, "7DF"):
+            return self._manufacturer(cmd)
+        if self.cea is not None or self.cra is not None:
+            return ["NO DATA"]  # generic request under leftover addressing: nothing matches
         eng = "7E8" if sc.family == "can" else "10"
         msgs: list[tuple[str, bytes]] = []
         can = sc.family == "can"
@@ -546,6 +657,10 @@ class ElmSimulator:
                     padded = (b"\x00" * 3 + text) if it == 0x02 else text
                     for n, i in enumerate(range(0, len(padded), 4), start=1):
                         msgs.append((eng, bytes([0x49, it, n]) + padded[i : i + 4]))
+            elif it in sc.mode09 and it == 0x06 and can:
+                msgs.append((eng, bytes([0x49, 0x06, 0x01]) + SYNTHETIC_CVN))
+            elif it in sc.mode09 and it == 0x0A and can:
+                msgs.append((eng, bytes([0x49, 0x0A, 0x01]) + SYNTHETIC_ECU_NAME))
         elif mode == 0x04:
             self.dtcs_cleared = True  # a real ECU would have erased fault memory here
             msgs.append((eng, b"\x44"))
@@ -555,6 +670,67 @@ class ElmSimulator:
         if not msgs:
             return ["NO DATA"]
         return self._format(msgs)
+
+    # -- synthetic manufacturer ECU ---------------------------------------------------
+    def _addressing(self, cmd: str) -> bool:
+        """AT SH / CEA / CRA / FC SH / FC SD / FC SM (only scenarios with a SimDde accept them)."""
+        import re as _re
+
+        m = _re.fullmatch(r"ATSH([0-7][0-9A-F]{2})", cmd)
+        if m:
+            self.header = m.group(1)
+            return True
+        m = _re.fullmatch(r"ATCEA([0-9A-F]{2})?", cmd)
+        if m:
+            self.cea = m.group(1)
+            return True
+        m = _re.fullmatch(r"ATCRA([0-7][0-9A-F]{2})?", cmd)
+        if m:
+            self.cra = m.group(1)
+            return True
+        m = _re.fullmatch(r"ATFCSH([0-7][0-9A-F]{2})", cmd)
+        if m:
+            self.fc_header = m.group(1)
+            return True
+        m = _re.fullmatch(r"ATFCSD((?:[0-9A-F]{2}){1,5})", cmd)
+        if m:
+            self.fc_data = m.group(1)
+            return True
+        m = _re.fullmatch(r"ATFCSM([012])", cmd)
+        if m:
+            self.fc_mode = int(m.group(1))
+            return True
+        return False
+
+    def baseline(self) -> bool:
+        return self.header in (None, "7DF") and self.cea is None and self.cra is None and self.fc_mode == 0
+
+    def _manufacturer(self, cmd: str) -> list[str]:
+        d = self.scenario.dde
+        if d is None or self.header != d.tx_can_id or self.cea != d.tx_ext:
+            return ["NO DATA"]
+        if self.cra not in (None, d.rx_can_id):
+            return ["NO DATA"]
+        payload = d.responses(self._t(), cmd)
+        if payload is None:
+            return ["NO DATA"]
+        self.manufacturer_requests.append(cmd)
+        sep = " " if self.spaces else ""
+        ext = bytes.fromhex(d.rx_ext) if d.rx_ext else b""
+        room = 7 - len(ext)  # single-frame payload room
+
+        def line(data: bytes) -> str:
+            return d.rx_can_id + sep + self._hex((ext + data).ljust(8, b"\x00"))
+
+        if len(payload) <= room:
+            return [line(bytes([len(payload)]) + payload)]
+        first = room - 1
+        out = [line(bytes([0x10 | (len(payload) >> 8), len(payload) & 0xFF]) + payload[:first])]
+        rest, seq = payload[first:], 1
+        while rest:
+            out.append(line(bytes([0x20 | seq]) + rest[:room]))
+            rest, seq = rest[room:], (seq + 1) & 0x0F
+        return out
 
     # -- output formatting ------------------------------------------------------
     def _hex(self, data: bytes) -> str:
@@ -603,7 +779,14 @@ class SimulatorTransport(Transport):
         sc = SCENARIOS[scenario] if isinstance(scenario, str) else scenario
         self.sim = ElmSimulator(sc, clock=self.clock, seed=seed)
 
+    def _in_drop(self) -> bool:
+        t = self.sim._t()
+        return any(a <= t < b for a, b in self.sim.scenario.link_drops)
+
     def connect(self) -> None:
+        if self._in_drop():
+            self.state = "disconnected"
+            raise TransportError("simulated Wi-Fi outage: adapter not reachable")
         self.state = "connected"
         self.generation += 1
         self._opened = self.clock.monotonic()
@@ -619,6 +802,10 @@ class SimulatorTransport(Transport):
         self.state = "disconnected"  # next _ensure_connected() is a fresh "connection"
 
     def _roundtrip(self, wire: bytes, timeout_s: float) -> tuple[bytes, str]:
+        if self._in_drop():
+            self.clock.sleep(0.05)
+            self.state = "disconnected"
+            return b"", "closed"
         raw, delay = self.sim.handle(wire.decode("ascii").rstrip("\r"))
         drop = self.sim.scenario.drop_after_s
         if drop is not None and self.clock.monotonic() - self._opened > drop:

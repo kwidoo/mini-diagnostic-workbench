@@ -14,30 +14,35 @@ regeneration, codes or programs anything. See [docs/SAFETY.md](docs/SAFETY.md).
 | | Status |
 |---|---|
 | Generic OBD live data (service 01), freeze frame (02), stored / pending / permanent DTCs (03 / 07 / 0A), vehicle info (09), raw monitor results (06) | Implemented. What the car actually supports is discovered at connect time. |
-| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available.** Shown as "not supported / not measured". Needs a BMW-capable tester. |
+| BMW DDE data: fault codes 4862 / 480A, DPF soot load and regeneration history, DPF differential pressure, EGR target/actual, injector corrections, commanded rail pressure | **Not available for this car yet.** A gated, read-only DDE path exists (capability check, request catalog, guarded transport, fault memory in scans, live values in the continuous recording; docs/DDE_*.md), but no BMW request is verified, so none is sent and nothing is shown as a value. Today a BMW-capable tester is still needed. |
 | Porsche ME7.8 specific data | **Not available**, same reason. |
 
 Details: [docs/OBD_SUPPORT_MATRIX.md](docs/OBD_SUPPORT_MATRIX.md).
 
-**Not yet validated on a car.** Everything was built and tested against the built-in
-fake ELM327. The first real connection is the test of the adapter assumptions listed
-in [docs/DIAGNOSTIC_PROTOCOL.md](docs/DIAGNOSTIC_PROTOCOL.md).
+**Real-car status.** Generic OBD over CAN (11-bit, 500 kbit/s) has been observed on the
+MINI in real recordings since 2026-11-18 (adapter `ELM327 v2.2` claim, ECUs `7E8` / `7E9`,
+service 01 / 02 / 03 / 06 discovery, stored `P115D`): see
+[docs/DDE_CAPABILITY.md](docs/DDE_CAPABILITY.md). That is not a full hardware validation
+(ISO-TP multi-frame, service 09 identification and K-line on the Porsche are still
+unobserved), so no profile carries the `hardware_validated` flag. The adapter assumptions
+are listed in [docs/DIAGNOSTIC_PROTOCOL.md](docs/DIAGNOSTIC_PROTOCOL.md).
 Profile status `generic_obd_ready` means generic OBD only: manufacturer DDE/DME
-diagnostics are not implemented, and no profile is hardware-validated yet. Follow the
+diagnostics are not implemented. Follow the
 checklist in [docs/HARDWARE_SETUP_MAC.md](docs/HARDWARE_SETUP_MAC.md) for the first
 real session.
 
-### Last verified test run (2026-11-17, Linux VM, Python 3.12+, Node 22)
+### Last verified test run (2026-11-18, Docker on macOS: python:3.12-slim image, node:22-slim)
 
 ```
-$ cd backend && uv run ruff check app tests && uv run pytest
+$ make docker-test   # backend: ruff check + pytest; frontend: vue-tsc --noEmit + vitest
 All checks passed!
-301 passed in 153.13s
-$ cd frontend && npm run typecheck && npm test
-> vue-tsc --noEmit
- Test Files  6 passed (6)
-      Tests  35 passed (35)
+450 passed
+ Test Files  10 passed (10)
+      Tests  55 passed (55)
 ```
+
+The BMW DDE work (DDE-01..06) is covered by `tests/test_dde_*.py` and
+`src/__tests__/dde-*.spec.ts`, against the simulator's invented DDE only.
 
 Continuous monitoring (docs/MONITORING.md) is covered by `tests/test_monitoring.py`,
 `tests/test_monitoring_api.py` and `src/__tests__/monitoring.spec.ts`, against synthetic
@@ -77,6 +82,10 @@ mini-obd probe --host 192.168.0.10 --port 35000 # adapter identity, protocol, EC
 mini-obd scan                                   # stored / pending / permanent DTCs + freeze frame
 mini-obd scan --read-vin                        # also read the VIN (kept local)
 mini-obd inventory                              # which PIDs the ECU supports, each read once
+mini-obd dde-capability                         # DDE-01: adapter + ECU identity report, no BMW request
+mini-obd dde-capability --session <id>          # same, offline from a stored session (read-only)
+mini-obd dde-catalog                            # DDE-02: BMW request catalog, per metric blocked / executable
+mini-obd dde-settings --opt-in --variant <v>    # DDE-03: opt in + record the DDE variant a BMW tester confirmed
 mini-obd record --duration 120 --profile idle   # timed recording with pre/post fault scans
 mini-obd record --profile mini_extended_monitoring --until-stop   # continuous; Ctrl-C stops and saves
 mini-obd annotate --event fan_running           # predefined event (also while another process records)
@@ -94,7 +103,7 @@ adapter (`healthy_idle`, `rough_idle`, `egr_mismatch`, `dpf_history`, `wifi_drop
 `unsupported_pids`, `slow_adapter`, `porsche_healthy_idle`, `porsche_bank_imbalance`, and the
 synthetic drive cycles `mini_city_drive`, `mini_highway_drive`, `mini_warmup`,
 `mini_dpf_regen_possible`, `mini_shutdown_during_regen`, `mini_voltage_drop`,
-`mini_ignition_off`, `mini_ecu_silent_running`). Continuous monitoring: docs/MONITORING.md.
+`mini_ignition_off`, `mini_ecu_silent_running`, `mini_dde_capability`). Continuous monitoring: docs/MONITORING.md.
 Add `--vehicle porsche-boxster-986-mk2` before the command for the other profile.
 
 ## First run on the actual MINI
@@ -131,6 +140,7 @@ backend/app/
   acquisition/   recorder, sampling metrics, live hub                  <- shared
   storage/       SQLite, transcript replay, export                     <- shared
   manufacturer/  read-only extension interface, off unless verified
+    bmw/         DDE capability, request catalog, guarded transport, faults, live values
   api/  cli.py  service.py
 frontend/        Vue 3 + TypeScript + Vite + Pinia + Tailwind v4
 fixtures/        synthetic transcripts

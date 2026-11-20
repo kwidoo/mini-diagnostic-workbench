@@ -1299,7 +1299,11 @@ def monitoring_summary(
         f["t_start_rel_s"], f["t_end_rel_s"] = clk.rel(f["t_start_wall"]), clk.rel(f["t_end_wall"])
     air = air_path_summary(sd, owner_reported)
     air["history"] = compare_to_cohort(sd.id, refs.get("air_path_rows") or [])
-    detected = [*regens, *interrupted, *cool["detected"], *air["detected_events"]]
+    from app.diagnostics.dde import dde_summary
+
+    dde = dde_summary(sd.session, sd.samples, clk.t0, sd.annotations)
+    confirmed = (dde.get("regeneration") or {}).get("confirmed") or []
+    detected = [*confirmed, *regens, *interrupted, *cool["detected"], *air["detected_events"]]
     return {
         "session_id": sd.id,
         "is_monitoring_session": is_monitoring_session(sd.session),
@@ -1321,7 +1325,8 @@ def monitoring_summary(
             ],
             "baseline": base,
             "limitations": regen_limits,
-            "confirmed_regenerations": [],  # stays empty: no verified ECU regeneration-state signal
+            # only from a fresh, decoded DDE regeneration flag (DDE-06); the inferred list above stays separate
+            "confirmed_regenerations": confirmed,
         },
         "detected_events": detected,
         "events": events,
@@ -1330,6 +1335,7 @@ def monitoring_summary(
         "sampling": sampling_quality(sd),
         "observed_capabilities": (sd.session["meta"].get("monitoring") or {}).get("observed_capabilities"),
         "air_path": air,
+        "dde": dde,
         "references": _public_refs(refs),
         "baseline_origin": baseline_origin(sd.session),
         "heuristics": HEURISTICS,
@@ -1375,6 +1381,18 @@ def history_row(
             1 for w in m["voltage"]["battery_warnings"] if w["event"] == "battery_warning"
         ),
         "possible_regenerations": len(m["dpf"]["possible_regenerations"]),
+        # measured by the DDE (never pooled with the inferred count above); None: no DDE data
+        "dde_confirmed_regenerations": len(m["dpf"]["confirmed_regenerations"])
+        if m["dde"].get("regeneration", {}).get("status") == "measured"
+        else None,
+        "dde_soot_last": next(
+            (
+                (x["stats"] or {}).get("last")
+                for x in m["dde"].get("signals", [])
+                if x["signal_key"] == "dpf_soot_mass"
+            ),
+            None,
+        ),
         "possible_interrupted_regenerations": len(m["dpf"]["possible_interrupted_regenerations"]),
         "user_suspected_regenerations": len(m["dpf"]["user_suspected"]),
         "coolant_max_c": m["coolant"].get("max_running"),

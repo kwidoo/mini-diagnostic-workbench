@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame
+from app.models.domain import Annotation, DtcScan, Exchange, FreezeFrame, Reading
 from app.obd.allowlist import AllowedCommand, ForbiddenRequestError
 from app.obd.client import (
     DTC_MODES,
@@ -22,7 +22,7 @@ from app.obd.client import (
     interpret_pid,
 )
 from app.parameters.standard_pids import BITMAP_PIDS
-from app.storage.db import Store
+from app.storage.db import Store, chronological
 
 FORMAT = "mini-obd-transcript/1"
 RECORDING_META_KEYS = (
@@ -36,6 +36,7 @@ RECORDING_META_KEYS = (
     "monitoring",
     "post_scan_skipped",
     "aborted",
+    "dde",
 )
 REDACTED = "[REDACTED]"
 
@@ -71,6 +72,11 @@ def transcript_lines(store: Store, sid: str, include_vin: bool = False) -> list[
         lines.append(json.dumps({"type": "exchange", **ex}, sort_keys=True))
     for a in store.annotations(sid):
         lines.append(json.dumps({"type": "annotation", **a.model_dump()}, sort_keys=True))
+    # manufacturer readings (DDE-05) are carried as decoded at recording time, with their decoder and
+    # catalog versions: replay never re-decodes manufacturer bytes with another layout
+    for smp in store.samples(sid):
+        if smp.get("source"):
+            lines.append(json.dumps({"type": "manufacturer_reading", **smp}, sort_keys=True))
     return lines
 
 
@@ -98,6 +104,14 @@ def ingest_transcript(
         for r in records
         if r["type"] == "annotation"
     ]
+    mfr_readings = []
+    for r in records:
+        if r["type"] != "manufacturer_reading":
+            continue
+        d = {k: v for k, v in r.items() if k != "type"}
+        st = d.pop("status_json", None)
+        d["status"] = json.loads(st) if st else None
+        mfr_readings.append(Reading(**d))
     started = exchanges[0].t_wall if exchanges else 0.0
     ended = exchanges[-1].t_wall if exchanges else 0.0
 
@@ -110,7 +124,8 @@ def ingest_transcript(
         try:
             cmd = AllowedCommand.parse(ex.request)
         except ForbiddenRequestError:
-            skipped.append(ex.request)  # nothing is ever sent during replay; just not interpreted
+            if ex.request not in skipped:  # e.g. DDE manufacturer exchanges: kept raw, not re-decoded
+                skipped.append(ex.request)  # nothing is ever sent during replay; just not interpreted
             continue
         if cmd.is_at:
             if cmd.text == "ATRV" and ex.phase == "record":
@@ -176,7 +191,10 @@ def ingest_transcript(
         meta=meta,
     )
     store.add_exchanges(sid, exchanges)
-    store.add_samples(sid, samples)
+    # one chronological timeline: generic OBD, adapter (ATRV) and manufacturer readings interleaved as
+    # recorded (they come from different record types in the transcript). Generic-only transcripts are
+    # inserted exactly as before (already in exchange order).
+    store.add_samples(sid, chronological([*samples, *mfr_readings]) if mfr_readings else samples)
     for scan in scans.values():
         store.add_scan(sid, scan)
     for a in annotations:

@@ -7,6 +7,7 @@ takes an arbitrary command.
 
 from __future__ import annotations
 
+import itertools
 import re
 import threading
 
@@ -50,6 +51,9 @@ INIT_SEQUENCE = ["ATE0", "ATL0", "ATS1", "ATH1", "ATAT1", "ATSP0"]
 INIT_REQUIRED = {"ATE0", "ATH1", "ATSP0"}
 _VOLTAGE = re.compile(r"\d{1,2}(\.\d{1,2})?\s?V", re.IGNORECASE)
 _PROBE_REPLY = re.compile(r"(^|\s)41\s?00(\s|[0-9A-F]|$)", re.IGNORECASE)
+
+
+_CONNECTION_IDS = itertools.count(1)
 
 
 class ObdError(Exception):
@@ -198,6 +202,13 @@ class ObdClient:
         self.probe_timeout_s = 15.0  # the 0100 bootstrap probe: protocol search can take seconds
         self.adapter = AdapterInfo()
         self.capabilities: Capabilities | None = None
+        # One adapter connection as opened by the user (Workbench.connect / attach creates a new client).
+        # Internal TCP resyncs / re-initialisations inside it keep this id: it is the same adapter.
+        self.connection_id = next(_CONNECTION_IDS)
+        # DDE-03: set once this adapter refused the documented manufacturer addressing ('?' to a set-up
+        # command). Kept for the whole connection - also across internal reconnects, which a refused
+        # restore itself triggers - so the refused set-up is never re-sent; a new connection starts clean.
+        self._dde_unsupported: dict[str, object] | None = None
         self.family = "unsupported"
         self._gen: int | None = None
         self._initialised_once = False  # a failed re-init is retried on the next query
@@ -391,6 +402,33 @@ class ObdClient:
             and t.generation == self._gen
         )
 
+    @property
+    def dde_unsupported(self) -> str | None:
+        st = self._dde_unsupported
+        return str(st["reason"]) if st and st["connection_id"] == self.connection_id else None
+
+    def mark_dde_unsupported(self, reason: str) -> None:
+        if self._dde_unsupported is None:
+            self._dde_unsupported = {
+                "reason": reason,
+                "connection_id": self.connection_id,
+                "transport_generation": self.transport.generation,
+                "t_wall": self.transport.clock.wall(),
+            }
+
+    def dde_adapter_state(self) -> dict[str, object] | None:
+        return dict(self._dde_unsupported) if self._dde_unsupported else None
+
+    def manufacturer_exchange(self, approved, timeout_s: float | None = None) -> list[Exchange] | None:
+        """DDE-03: send one ApprovedRequest transaction (set-up, request, restore) on the CURRENT,
+        already-initialised connection. Never reconnects or re-initialises for it: returns None
+        (not attempted) when the link would first need that - generic polling re-initialises the
+        adapter under the existing rules, a manufacturer read never triggers it."""
+        with self._lock:
+            if not self.link_ready():
+                return None
+            return self.transport.send_manufacturer(approved, timeout_s)
+
     def read_adapter_voltage(self, allow_reinit: bool = True) -> Reading | None:
         """Adapter supply voltage via ATRV (an adapter command: nothing is sent to the vehicle bus).
 
@@ -491,6 +529,50 @@ class ObdClient:
             info["vin"] = vins[0]["text"] if vins else None
             info["vin_status"] = "read" if vins else "no_data"
         return info
+
+    def identification(self, include_vin: bool = False) -> dict[str, dict[str, object]]:
+        """Service 09 identification InfoTypes that the allowlist permits: calibration ID (04),
+        CVN (06), ECU name (0A) and - only with explicit consent - the VIN (02).
+
+        Every InfoType gets an explicit status: ``read`` (positive answer, raw bytes kept),
+        ``not_supported`` (the ECUs did not advertise it), ``not_attempted`` (VIN without
+        consent), ``no_data`` / ``negative`` / ``timeout`` / ``error`` / ``disconnected``
+        (requested, no usable answer). Nothing is decoded beyond printable text.
+        """
+        supported = {p for e in self._caps().ecus for p in e.mode09_pids}
+        out: dict[str, dict[str, object]] = {}
+        for infotype, key in ((0x04, "calibration_id"), (0x06, "cvn"), (0x0A, "ecu_name"), (0x02, "vin")):
+            entry: dict[str, object] = {"infotype": f"{infotype:02X}", "answers": []}
+            if infotype not in supported:
+                entry["status"] = "not_supported"
+            elif infotype == 0x02 and not include_vin:
+                entry["status"] = "not_attempted"
+                entry["detail"] = "VIN is read only with explicit consent"
+            else:
+                ex, reply, msgs, problems = self.query(AllowedCommand.obd(0x09, infotype))
+                good = _positive(msgs, bytes([0x49, infotype])) if reply.status == ElmStatus.OK else []
+                if not good:
+                    q, d = _failure_quality(ex, reply, msgs, problems)
+                    entry["status"], entry["detail"] = q, d
+                else:
+                    by_ecu: dict[str, bytes] = {}
+                    for m in good:
+                        by_ecu[m.ecu] = by_ecu.get(m.ecu, b"") + m.payload[3:]
+                    entry["status"] = "read"
+                    entry["answers"] = [
+                        {
+                            "ecu": e,
+                            "raw_hex": b.hex().upper(),
+                            # printable text only for text InfoTypes; CVNs are binary checksums
+                            "text": None
+                            if infotype == 0x06
+                            else b.replace(b"\x00", b"").decode("latin-1").strip(),
+                        }
+                        for e, b in by_ecu.items()
+                    ]
+                entry["exchange_seq"] = ex.seq
+            out[key] = entry
+        return out
 
     def monitors(self) -> list[dict[str, str]]:
         """Service 06 results, raw. Scaling (unit-and-scaling IDs) is not decoded."""

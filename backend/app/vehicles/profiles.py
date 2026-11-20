@@ -75,6 +75,11 @@ class VehicleProfile:
         "Not hardware-validated: tested against the synthetic ELM327 simulator only, not yet on this vehicle."
     )
 
+    @property
+    def supports_dde(self) -> bool:
+        """BMW DDE manufacturer path (gated, off by default) applies to this profile."""
+        return any(e.startswith("bmw-dde") for e in self.ecu_ids)
+
     def recording_profile(self, profile_id: str) -> RecordingProfile:
         for p in self.recording_profiles:
             if p.id == profile_id:
@@ -253,6 +258,11 @@ MINI_R60_DIESEL = VehicleProfile(
         "Stop immediately on metallic knocking, overheating, exhaust/coolant smell or a flashing MIL.",
     ),
     monitoring_events=MINI_MONITORING_EVENTS,
+    hardware_validation_note=(
+        "Not hardware-validated as a whole. Generic OBD over CAN 11/500 was observed on this vehicle in real "
+        "recordings (2026-11-18: ECUs 7E8/7E9, services 01/02/03/06); ISO-TP multi-frame and service 09 "
+        "identification are not yet observed, and BMW DDE data is not read (docs/DDE_CAPABILITY.md)."
+    ),
 )
 
 PORSCHE_986 = VehicleProfile(

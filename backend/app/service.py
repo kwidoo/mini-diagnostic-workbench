@@ -19,7 +19,7 @@ from app.adapters.base import Transport
 from app.adapters.simulator import SCENARIOS, FakeElmServer
 from app.adapters.tcp import DEFAULT_HOST, DEFAULT_PORT, VgateWiFiTransport
 from app.manufacturer.extension import ExtensionRegistry, default_registry
-from app.models.domain import Annotation, Exchange, Reading
+from app.models.domain import Annotation, DtcScan, Exchange, Reading
 from app.obd.client import ObdClient
 from app.storage.db import Store
 from app.vehicles.profiles import (
@@ -272,7 +272,12 @@ class Workbench:
     # -- sessions ----------------------------------------------------------------
     @contextmanager
     def _session(self, kind: str, label: str):
-        what = {"scan": "scan", "snapshot": "inventory", "record": "recording"}[kind]
+        what = {
+            "scan": "scan",
+            "snapshot": "inventory",
+            "record": "recording",
+            "capability": "DDE capability assessment",
+        }[kind]
         with self._exclusive(what):
             client = self._need_client()
             if self.connected_profile != self.profile.id:  # e.g. changed by another process
@@ -380,10 +385,25 @@ class Workbench:
             if readings:
                 self.store.add_samples(self._sid, readings)
 
+    def _with_dde_faults(self, scan: DtcScan) -> DtcScan:
+        """DDE-04: attach the BMW DDE fault-memory read to a generic scan (MINI only). Sends nothing
+        unless an executable fault-memory entry passes every gate; otherwise records why not."""
+        if not self.profile.supports_dde:
+            return scan
+        from app.manufacturer.bmw.faults import read_fault_memory
+
+        phase = self._phase
+        self._phase = "dde:faults"
+        try:
+            scan.manufacturer = read_fault_memory(self.dde_runtime())
+        finally:
+            self._phase = phase
+        return scan
+
     def scan(self, label: str = "", read_vin: bool = False, freeze_frame: bool = True) -> str:
         with self._session("scan", label) as (sid, client, meta):
             self._phase = "scan:scan"
-            self.store.add_scan(sid, client.scan_dtcs("scan", freeze_frame))
+            self.store.add_scan(sid, self._with_dde_faults(client.scan_dtcs("scan", freeze_frame)))
             self._phase = "info"
             meta["vehicle_info"] = client.vehicle_info(read_vin)
         return sid
@@ -392,10 +412,150 @@ class Workbench:
         with self._session("snapshot", label) as (sid, client, meta):
             self._phase = "inventory"
             self._flush(client.snapshot())
+            rt = self.dde_runtime()
+            if rt is not None:
+                # DDE-05: each executable manufacturer live signal once (none for the real car today)
+                from app.manufacturer.bmw.live import DdeLiveReader
+
+                self._phase = "dde:inventory"
+                live = DdeLiveReader(rt)
+                self._flush(live.snapshot())
+                meta["dde_live"] = {
+                    "catalog_version": rt.catalog.version,
+                    "synthetic": rt.ctx.synthetic_session,
+                    "availability": live.availability(),
+                }
             self._phase = "info"
             meta["vehicle_info"] = client.vehicle_info(read_vin)
             meta["monitors"] = client.monitors()
         return sid
+
+    def dde_capability(self, label: str = "", read_vin: bool = False) -> str:
+        """DDE-01: repeatable capability assessment on the existing connection.
+
+        Sends only what the generic allowlist already permits: service 09 identification
+        InfoTypes (calibration ID, CVN, ECU name; VIN only with consent). No manufacturer
+        request exists on this path. The report is computed from the session's own raw trace
+        (including the adapter initialisation) and stored in ``meta["dde_capability"]``.
+        """
+        from app.manufacturer.bmw.capability import assess
+
+        with self._session("capability", label) as (sid, client, meta):
+            self._phase = "capability"
+            ident = client.identification(include_vin=read_vin)
+            if read_vin:
+                vins = ident["vin"].get("answers") or []
+                meta["vehicle_info"] = {
+                    "vin": vins[0]["text"] if vins else None,
+                    "vin_status": "read" if vins else ident["vin"]["status"],
+                    "calibration_ids": [
+                        {k: a[k] for k in ("ecu", "text", "raw_hex")}
+                        for a in ident["calibration_id"].get("answers") or []
+                    ],
+                }
+            self._flush()
+            meta["dde_capability"] = assess(
+                adapter=client.adapter.model_dump(),
+                capabilities=client.capabilities.model_dump() if client.capabilities else None,
+                exchanges=self.store.exchanges(sid),
+                source=self.source,
+                synthetic=self.source != "real",
+                session_id=sid,
+                assessed_at=client.transport.clock.wall(),
+            )
+        return sid
+
+    # -- DDE-03: gated manufacturer reads -----------------------------------------------------
+    def dde_settings(self, profile_id: str | None = None) -> dict[str, Any]:
+        """User-controlled DDE settings per vehicle profile: explicit opt-in (default OFF) and the
+        DDE variant as confirmed by the user (e.g. from a BMW tester printout; never inferred)."""
+        prof = get_profile(profile_id) if profile_id else self.profile
+        return self.store.get_setting(f"dde:{prof.id}", {"opt_in": False, "confirmed_variant": None})
+
+    def set_dde_settings(
+        self, opt_in: bool | None = None, confirmed_variant: str | None = None, clear_variant: bool = False
+    ) -> dict[str, Any]:
+        prof = self.profile
+        if not prof.supports_dde:
+            raise ValueError(f"{prof.id} has no BMW DDE")
+        cur = dict(self.dde_settings())
+        if opt_in is not None:
+            cur["opt_in"] = bool(opt_in)
+        if clear_variant:
+            cur["confirmed_variant"] = None
+        elif confirmed_variant is not None:
+            v = confirmed_variant.strip()
+            if not v or len(v) > 80:
+                raise ValueError("confirmed variant must be 1..80 characters")
+            cur["confirmed_variant"] = v
+        cur["updated_at"] = time.time()
+        self.store.set_setting(f"dde:{prof.id}", cur)
+        return cur
+
+    def dde_context(self):
+        """ExecutionContext for the current connection: opt-in + variant from the settings, the
+        DDE-01 verdict from the latest REAL capability report, simulator or real."""
+        from app.manufacturer.bmw.catalog import ExecutionContext
+
+        st = self.dde_settings()
+        synthetic = self.source != "real"
+        verdict = None
+        if not synthetic:
+            rep = self.latest_dde_capability(real_only=True)
+            verdict = rep["verdicts"]["manufacturer_transport"]["verdict"] if rep else None
+        return ExecutionContext(
+            opted_in=bool(st.get("opt_in")),
+            confirmed_variant=st.get("confirmed_variant"),
+            adapter_verdict=verdict,
+            synthetic_session=synthetic,
+        )
+
+    def dde_catalog(self):
+        """Real catalog for a real adapter; the SYNTHETIC catalog only against the simulator."""
+        from app.manufacturer.bmw.catalog import default_catalog
+
+        if self.source == "simulator":
+            from app.manufacturer.bmw.synthetic import synthetic_catalog
+
+            return synthetic_catalog()
+        return default_catalog()
+
+    def dde_runtime(self):
+        """A DdeRuntime for the current connection, or None (no connection / no DDE on this profile)."""
+        from app.manufacturer.bmw.runtime import DdeRuntime
+
+        if self.client is None or not self.profile.supports_dde:
+            return None
+        return DdeRuntime(self.dde_catalog(), self.dde_context(), self.client)
+
+    def dde_status(self) -> dict[str, Any]:
+        prof = self.profile
+        if not prof.supports_dde:
+            return {"vehicle_profile": prof.id, "supported": False}
+        cat = self.dde_catalog()
+        ctx = self.dde_context()
+        return {
+            "vehicle_profile": prof.id,
+            "supported": True,
+            "settings": self.dde_settings(),
+            "connected": self.client is not None,
+            "source": self.source,
+            # DDE-03: refusal of the manufacturer addressing, remembered for this adapter connection
+            "adapter_state": self.client.dde_adapter_state() if self.client else None,
+            **cat.describe(ctx),
+        }
+
+    def latest_dde_capability(
+        self, profile_id: str | None = None, real_only: bool = False
+    ) -> dict[str, Any] | None:
+        """Most recent stored capability report for a vehicle profile (None if never run)."""
+        prof = get_profile(profile_id) if profile_id else self.profile
+        for s in reversed(self.store.list_sessions(prof.id, order="rowid")):
+            if s["kind"] == "capability" and s["meta"].get("dde_capability"):
+                if real_only and s["synthetic"]:
+                    continue
+                return s["meta"]["dde_capability"]
+        return None
 
     def recording_profile(self, profile_id: str) -> RecordingProfile:
         return self.profile.recording_profile(profile_id)
@@ -464,6 +624,32 @@ class Workbench:
             )
             if drive_type:
                 meta["user_labels"] = {"drive_type": drive_type}
+            dde_live = None
+            dde_plan: list[dict[str, Any]] = []
+            if tiered and rp is not None and rp.monitoring and self.profile.supports_dde:
+                # DDE-06: one scheduler, one lock, one session - manufacturer items only when executable
+                from app.manufacturer.bmw.live import DdeLiveReader, monitoring_plan
+
+                rt = self.dde_runtime()
+                if rt is not None:
+                    dde_live = DdeLiveReader(rt)
+                    dde_plan = monitoring_plan(dde_live, rp.tiers)
+                    ctx = rt.ctx
+                    meta["dde"] = {
+                        "opted_in": ctx.opted_in,
+                        "confirmed_variant": ctx.confirmed_variant,
+                        "adapter_verdict": ctx.adapter_verdict,
+                        "synthetic": ctx.synthetic_session,
+                        "catalog_version": rt.catalog.version,
+                        "plan": dde_plan,
+                        "status": "polling" if dde_plan else "not_polled",
+                        "reason": None
+                        if dde_plan
+                        else "no executable manufacturer live signal (generic monitoring only); see availability",
+                        "availability": dde_live.availability(),
+                    }
+                    if not dde_plan:
+                        dde_live = None
             if tiered and rp is not None:
                 meta["sampling_plan"] = {
                     "tiers": rp.tiers.as_dict() if rp.tiers else None,
@@ -517,9 +703,10 @@ class Workbench:
             try:
                 if pre_scan:
                     self._phase = "scan:pre"
-                    self.store.add_scan(sid, client.scan_dtcs("pre", freeze_frame))
+                    self.store.add_scan(sid, self._with_dde_faults(client.scan_dtcs("pre", freeze_frame)))
                 self._phase = "record"
                 if tiered and rp is not None and rp.tiers is not None:
+                    self._phase = "record"
                     monitor = MonitoringRecorder(
                         client,
                         plan,
@@ -533,6 +720,8 @@ class Workbench:
                         on_state,
                         resume_probe_s=resume_probe_s,
                         primary_ecu=client.capabilities.primary_ecu if client.capabilities else None,
+                        dde_live=dde_live,
+                        dde_plan=dde_plan,
                     )
                     monitor.run()
                 else:
@@ -555,7 +744,9 @@ class Workbench:
                         )
                     else:
                         self._phase = "scan:post"
-                        self.store.add_scan(sid, client.scan_dtcs("post", freeze_frame))
+                        self.store.add_scan(
+                            sid, self._with_dde_faults(client.scan_dtcs("post", freeze_frame))
+                        )
             except BaseException as exc:  # keep what was captured; record why it ended
                 meta["aborted"] = f"{type(exc).__name__}: {exc}"
                 self._flush(list(pending))

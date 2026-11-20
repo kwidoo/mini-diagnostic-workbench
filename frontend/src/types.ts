@@ -22,6 +22,8 @@ export interface MonitorState {
   adapter_link?: 'ok' | 'lost'
   /** an explicit resume re-initialises the adapter first (ATZ ... 0100) */
   resume_requires_reinit?: boolean
+  /** DDE-06: manufacturer reads in this recording (null: none polled) */
+  dde?: MonitorDde | null
 }
 export type Tier = 'fast' | 'medium' | 'slow'
 export interface TierIntervals { fast: number; medium: number; slow: number }
@@ -70,12 +72,29 @@ export interface VehicleRecord { confirmed: Record<string, string>; owner_report
 export interface Reading {
   mode: number; pid: number; ecu: string | null; name: string; unit: string | null; value: number | null
   text: string | null; raw_hex: string; quality: string; detail: string | null; t_wall: number; t_mono: number; latency_ms: number
+  /** DDE-05 provenance: present only on manufacturer readings (mode 0x100) */
+  source?: string; signal_key?: string; request_id?: string; decoder_version?: string; catalog_version?: string
+  status_json?: string
 }
 export interface Dtc { code: string; raw_hex: string; kind: string; ecu: string | null }
 export interface FreezeFrame { status: string; dtc: string | null; dtc_raw_hex: string | null; ecu: string | null; readings: Reading[] }
+/** DDE-04: BMW DDE fault memory read with a scan; kept apart from the generic codes. */
+export interface ManufacturerFault {
+  code: string; raw_hex: string; status_raw: string | null; status: Record<string, boolean> | null; counter: number | null
+}
+export interface ManufacturerFaultRead {
+  origin: 'bmw_dde'
+  status: 'not_attempted' | 'unavailable' | 'unsupported_adapter' | 'read' | 'no_faults' | 'partial' | 'negative'
+    | 'no_data' | 'timeout' | 'disconnected' | 'error'
+  detail: string | null; synthetic: boolean; request_id: string | null; catalog_version: string | null
+  decoder_version: string | null; ecu: string | null; raw_hex: string; nrc: string | null; faults: ManufacturerFault[]
+}
 export interface DtcScan {
   t_wall: number; phase: string; dtcs: Dtc[]; mode_status: Record<string, string>
   mil_on: boolean | null; dtc_count_reported: number | null; freeze_frame: FreezeFrame | null
+  origin?: 'generic_obd'
+  /** absent / null on older scans and other vehicles */
+  manufacturer?: ManufacturerFaultRead | null
 }
 export interface Metric {
   pid: number; name: string; attempts: number; ok: number; dropped: number; error_rate: number; actual_hz: number
@@ -168,8 +187,11 @@ export interface MonitoringSummary {
   dpf: {
     availability: { group: 'wanted' | 'standard_pids' | 'manufacturer'; items: { key?: string; hex?: string; name: string; status: DataStatus; via?: string; reason?: string; samples?: number }[] }[]
     possible_regenerations: DetectedEvent[]; possible_interrupted_regenerations: DetectedEvent[]
-    user_suspected: { t_rel_s: number; note: string; origin: Origin }[]; limitations: string[]; confirmed_regenerations: never[]
+    user_suspected: { t_rel_s: number; note: string; origin: Origin }[]; limitations: string[]
+    /** only from a fresh, decoded DDE regeneration flag (DDE-06); empty otherwise */
+    confirmed_regenerations: DdeRegeneration[]
   }
+  dde?: DdeMonitoringSummary
   detected_events: DetectedEvent[]
   events: { t_rel_s: number; label: string; event_type: string | null; origin: Origin; confidence: string | null; note: string }[]
   link: { type: string; t_rel_s: number; gap_s: number | null; note: string }[]
@@ -261,3 +283,76 @@ export interface HistoryRow {
   air_path?: AirPathRow
 }
 export interface LiveSignal { pid: number; name: string; unit: string | null; value: number | null; quality: string; at: number; points: Point[]; attempts: number; ok: number; first: number }
+
+/** DDE-01 capability report: every field says where it came from and how much it is worth. */
+export type CapQuality = 'observed' | 'claimed' | 'derived' | 'not_supported' | 'not_attempted' | 'failed' | 'unknown'
+export interface CapField {
+  value: unknown; quality: CapQuality; source: string | null; detail: string; exchange_seq?: number | null
+}
+export type ManufacturerTransportVerdict =
+  | 'manufacturer_transport_blocked' | 'manufacturer_transport_unverified' | 'manufacturer_transport_candidate'
+export interface DdeCapabilityReport {
+  format: string; session_id: string | null; assessed_at: number; source: string; synthetic: boolean
+  adapter: Record<'identity' | 'device_description' | 'claimed_elm_version' | 'supply_voltage' | 'chip', CapField> & { notes: string[] }
+  protocol: Record<'number' | 'name' | 'can_11bit_500k', CapField>
+  ecus: { source_id: string; primary: boolean; mode01_pids: number; mode09_infotypes: string[]; role: string }[]
+  identification: Record<string, CapField>
+  isotp_multiframe: CapField
+  dde: Record<'variant' | 'software_version' | 'manufacturer_requests_sent', CapField>
+  verdicts: {
+    generic_obd: { verdict: string; reasons: string[] }
+    manufacturer_transport: { verdict: ManufacturerTransportVerdict; blockers: string[]; unverified: string[]; meaning: string }
+  }
+}
+
+/** DDE-03: catalog availability under the current opt-in / variant / adapter verdict. */
+export interface DdeAvailability {
+  metric: string; title?: string; priority?: string; kind?: string
+  status: 'executable' | 'blocked' | 'unavailable'; reasons: string[]; establish_by?: string[]
+}
+export interface DdeStatus {
+  vehicle_profile: string; supported: boolean
+  settings?: { opt_in: boolean; confirmed_variant: string | null; updated_at?: number }
+  connected?: boolean; source?: string; version?: string; synthetic?: boolean
+  context?: { opted_in: boolean; confirmed_variant: string | null; adapter_verdict: string | null; synthetic_session: boolean }
+  availability?: DdeAvailability[]
+}
+
+/** DDE-06: live manufacturer state of a running monitoring recording (MonitorState.dde). */
+export interface MonitorDdeSignal {
+  title: string | null; tier: Tier; interval_s: number; value: number | null; text: string | null; unit: string | null
+  quality: string | null; detail: string | null; age_s: number | null; stale: boolean; suspended: boolean
+  /** wall time (s) of the reading and until when it counts as fresh; the panel ages it on its own clock */
+  t_wall?: number | null; fresh_until_wall?: number | null
+}
+export interface MonitorDde {
+  enabled: boolean; synthetic: boolean; catalog_version: string; unsupported_adapter: string | null; scale: number
+  signals: Record<string, MonitorDdeSignal>
+  regeneration: {
+    state: 'active' | 'inactive' | 'unknown'; source: string | null
+    measured_at_wall?: number | null; fresh_until_wall?: number | null; freshness_window_s?: number
+  }
+  /** every *_share is a share of WALL-CLOCK time in the last adaptation window; busy_time_share is DDE / link busy time */
+  scheduling?: {
+    target_share: number; allowed_share: number; projected_share: number; measured_share: number
+    busy_time_share?: number; window_s?: number; transaction_s: number | null; target_exceeded: boolean
+  }
+}
+/** DDE-06: manufacturer section of a monitoring summary. */
+export interface DdeRegeneration {
+  type: string; origin: string; status: string; source: string; t_start_rel_s: number | null; t_end_rel_s: number | null
+  duration_s: number; samples: number; started?: string; ended: string; synthetic: boolean; text: string
+  /** null lower bound: start not bounded (e.g. active before an unknown gap) */
+  started_between_rel_s?: (number | null)[]; ended_between_rel_s?: (number | null)[]
+}
+export interface DdeMonitoringSummary {
+  status: string; reason?: string | null; synthetic?: boolean; catalog_version?: string | null; opted_in?: boolean | null
+  confirmed_variant?: string | null; adapter_verdict?: string | null
+  signals?: {
+    signal_key: string; title: string; provenance: string; unit: string | null; tier: string | null; samples_ok: number
+    failed: Record<string, number>; status: string; stats: { n: number; min: number; max: number; median: number; first: number; last: number } | null
+  }[]
+  regeneration?: { signal_key: string | null; confirmed: DdeRegeneration[]; unknown_gaps: { from_rel_s: number | null; to_rel_s: number | null; gap_s: number }[]; status: string }
+  commanded_vs_actual?: Record<string, { pairs: number; mean_delta: number; mean_abs_delta: number; max_abs_delta: number; note: string }>
+  limitations?: string[]
+}

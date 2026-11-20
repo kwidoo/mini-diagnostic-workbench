@@ -5,6 +5,7 @@ import type { Signal, VoltageSource } from '../../types'
 import LineChart from '../LineChart.vue'
 import { coords, timeDomain } from '../chart'
 import AirPathPanel from './AirPathPanel.vue'
+import DdeMonitorPanel from './DdeMonitorPanel.vue'
 import DataBadge from './DataBadge.vue'
 import DataLegend from './DataLegend.vue'
 import EventMarkerBar from './EventMarkerBar.vue'
@@ -203,9 +204,13 @@ const sources = computed<[string, VoltageSource][]>(() => (m.value ? [['ECU', m.
           <div v-for="(u, i) in m.dpf.user_suspected" :key="`u${i}`"><DataBadge kind="manual" /> suspected regeneration marked at {{ t(u.t_rel_s) }}</div>
           <p v-if="!m.dpf.possible_regenerations.length && !m.dpf.limitations.length" class="text-ink-2">No possible regeneration inferred.</p>
           <p v-for="l in m.dpf.limitations" :key="l" class="text-xs text-ink-2">{{ l }}</p>
-          <p class="text-xs text-ink-2">Confirmed regenerations: none can be confirmed through generic OBD (no verified ECU signal).</p>
+          <p class="text-xs text-ink-2" data-test="confirmed-note">
+            Confirmed regenerations: {{ m.dpf.confirmed_regenerations.length ? `${m.dpf.confirmed_regenerations.length}, confirmed by the DDE regeneration flag (see BMW DDE values)` : 'none (only a fresh, verified DDE flag can confirm one; generic OBD cannot)' }}.
+          </p>
         </div>
       </section>
+
+      <DdeMonitorPanel v-if="m.dde && m.dde.status !== 'not_recorded'" :summary="m.dde" :inferred-regenerations="m.dpf.possible_regenerations.length" />
 
       <section class="panel text-sm" data-test="coolant-panel">
         <h2 class="h2">Cooling</h2>

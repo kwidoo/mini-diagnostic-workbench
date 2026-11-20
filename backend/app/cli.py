@@ -20,7 +20,7 @@ from app.obd.client import ObdError
 from app.parameters.standard_pids import PIDS, RAW_ONLY_PIDS, pid_name
 from app.service import BusyError, NotConnectedError, Workbench
 from app.storage.db import Store
-from app.storage.export import build_files, build_zip
+from app.storage.export import build_files, build_zip, render_dde_faults
 from app.storage.transcript import ingest_file
 from app.vehicles.profiles import MONITORING_EVENT_IDS, PROFILES
 
@@ -75,6 +75,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-freeze-frame", action="store_true")
     p.add_argument("--label", default="")
+    p = sub.add_parser(
+        "dde-capability",
+        help="DDE-01: assess adapter + engine ECU identity for BMW DDE access (generic OBD only; "
+        "no manufacturer request). With --session: assess a stored session offline, read-only",
+    )
+    _connection_args(p)
+    p.add_argument("--read-vin", action="store_true", help="also read the VIN (never shown in the report)")
+    p.add_argument("--label", default="")
+    p.add_argument(
+        "--session",
+        default=None,
+        help="assess a stored session instead of connecting (id or 'latest'); nothing is changed",
+    )
+    p.add_argument("--out", default=None, help="also write the report: *.json or *.md")
+    sub.add_parser(
+        "dde-catalog", help="DDE-02: BMW DDE request catalog - per metric executable / blocked and why"
+    )
+    p = sub.add_parser(
+        "dde-settings",
+        help="DDE-03: opt in / out of gated BMW DDE reads and record the DDE variant you confirmed "
+        "(default: opted out). Shows what is executable and why not",
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--opt-in", action="store_true", help="allow manufacturer reads that pass every gate")
+    g.add_argument("--opt-out", action="store_true")
+    g2 = p.add_mutually_exclusive_group()
+    g2.add_argument("--variant", default=None, help="DDE variant as confirmed by a BMW-capable tester")
+    g2.add_argument("--clear-variant", action="store_true")
     p = sub.add_parser("inventory", help="list supported PIDs and read each once")
     _connection_args(p)
     p.add_argument("--read-vin", action="store_true")
@@ -203,6 +231,8 @@ def _print_scans(store: Store, sid: str) -> None:
             for r in ff.readings:
                 if r.value is not None:
                     print(f"    {r.name}: {r.value} {r.unit or ''}")
+        for line in render_dde_faults(sc):
+            print("  " + line.replace("**", ""))
 
 
 def _print_findings(findings) -> None:
@@ -326,6 +356,19 @@ def _print_monitoring(m: dict) -> None:
         print(f"limitation: {line}")
     for e in m["link"]:
         print(f"link {t(e['t_rel_s'])}: {e['type']}")
+    d = m.get("dde") or {}
+    if d.get("status") not in (None, "not_recorded"):
+        print(
+            f"BMW DDE{' [SYNTHETIC]' if d.get('synthetic') else ''}: {d['status']}"
+            + (f" ({d['reason']})" if d.get("reason") else "")
+        )
+        for x in d["signals"]:
+            st = x["stats"] or {}
+            print(
+                f"  {x['signal_key']:<30}{x['status']:<10}ok {x['samples_ok']:<5} last {st.get('last', '-')} {x['unit'] or ''}"
+            )
+        for e in d["regeneration"]["confirmed"]:
+            print(f"  regeneration CONFIRMED by DDE at {t(e['t_start_rel_s'])}: {e['duration_s']:.0f} s")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -403,6 +446,83 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
             )
         return 0
 
+    if a.cmd == "dde-capability":
+        from app.manufacturer.bmw.capability import assess_session, render_markdown, report_rows
+
+        if a.session:
+            sid = _resolve(store, a.session)
+            report = assess_session(store, sid)
+        else:
+            _connect(wb, a)
+            sid = wb.dde_capability(a.label, a.read_vin)
+            report = store.get_session(sid)["meta"]["dde_capability"]
+        if a.out:
+            out = Path(a.out)
+            out.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n"
+                if out.suffix == ".json"
+                else render_markdown(report),
+                encoding="utf-8",
+            )
+            print(f"wrote {out}", file=sys.stderr)
+        if a.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        v = report["verdicts"]
+        print(f"session {sid}" + ("  [SYNTHETIC DATA]" if report["synthetic"] else ""))
+        print(f"generic OBD           : {v['generic_obd']['verdict']}")
+        print(f"manufacturer transport: {v['manufacturer_transport']['verdict']}")
+        for b in v["manufacturer_transport"]["blockers"]:
+            print(f"  blocker   : {b}")
+        for b in v["manufacturer_transport"]["unverified"]:
+            print(f"  unverified: {b}")
+        for name, val, quality, src in report_rows(report):
+            print(f"  {name:<34}{quality:<14}{val[:60]:<62}{src}")
+        if not a.session:
+            print(f"export for review (VIN redacted): mini-obd export --session {sid}", file=sys.stderr)
+        return 0
+
+    if a.cmd == "dde-settings":
+        if a.opt_in or a.opt_out or a.variant is not None or a.clear_variant:
+            wb.set_dde_settings(
+                opt_in=True if a.opt_in else (False if a.opt_out else None),
+                confirmed_variant=a.variant,
+                clear_variant=a.clear_variant,
+            )
+        st = wb.dde_status()
+        if a.json:
+            print(json.dumps(st, indent=2))
+            return 0
+        if not st["supported"]:
+            print(f"{st['vehicle_profile']}: no BMW DDE")
+            return 0
+        s_ = st["settings"]
+        print(
+            f"opt-in: {'YES' if s_.get('opt_in') else 'no'}; confirmed DDE variant: {s_.get('confirmed_variant') or '-'}"
+        )
+        print(
+            f"catalog {st['version']}; adapter verdict: {st['context']['adapter_verdict'] or 'not assessed'}"
+        )
+        for m in st["availability"]:
+            print(f"  {m['metric']:<30}{m['status']:<11}{(m['reasons'] or [''])[0][:80]}")
+        return 0
+
+    if a.cmd == "dde-catalog":
+        from app.manufacturer.bmw.catalog import ExecutionContext, default_catalog
+
+        cat = default_catalog()
+        desc = cat.describe(ExecutionContext())
+        if a.json:
+            print(json.dumps(desc, indent=2))
+            return 0
+        n_exec = sum(m["status"] == "executable" for m in desc["availability"])
+        print(f"catalog {cat.version}: {n_exec} executable of {len(desc['availability'])} metrics")
+        for m in desc["availability"]:
+            print(
+                f"  {m.get('priority', '-'):<3}{m['metric']:<30}{m['status']:<11}{(m['reasons'] or [''])[0][:70]}"
+            )
+        return 0
+
     if a.cmd == "inventory":
         _connect(wb, a)
         sid = wb.inventory(a.label, a.read_vin)
@@ -431,10 +551,20 @@ def _run(a: argparse.Namespace, store: Store, wb: Workbench) -> int:
                 "\nsupported but raw-only (no verified decoder in this tool): "
                 + ", ".join(f"{p:02X} {RAW_ONLY_PIDS[p]}" for p in raw)
             )
-        print("\nmanufacturer-specific parameters: UNAVAILABLE through this tool")
-        for ext in wb.registry.status(wb.profile.ecu_ids):
-            for prm in ext["parameters"]:
-                print(f"  - {prm['name']}: {prm['status']}")
+        dl = store.get_session(sid)["meta"].get("dde_live")
+        if dl and any(m["status"] == "executable" for m in dl["availability"]):
+            tag = " [SYNTHETIC catalog, simulator only]" if dl["synthetic"] else ""
+            print(f"\nBMW DDE live signals (catalog {dl['catalog_version']}){tag}:")
+            for m in dl["availability"]:
+                why = "" if m["status"] == "executable" else f" - {(m['reasons'] or [''])[0][:80]}"
+                print(f"  - {m['title'] or m['metric']}: {m['status']}{why}")
+        else:
+            print(
+                "\nmanufacturer-specific parameters: UNAVAILABLE through this tool (see: mini-obd dde-settings)"
+            )
+            for ext in wb.registry.status(wb.profile.ecu_ids):
+                for prm in ext["parameters"]:
+                    print(f"  - {prm['name']}: {prm['status']}")
         return 0
 
     if a.cmd == "record":
