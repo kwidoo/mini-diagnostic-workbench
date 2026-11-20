@@ -322,16 +322,28 @@ export interface DdeStatus {
 export interface MonitorDdeSignal {
   title: string | null; tier: Tier; interval_s: number; value: number | null; text: string | null; unit: string | null
   quality: string | null; detail: string | null; age_s: number | null; stale: boolean; suspended: boolean
+  /** wall time (s) of the reading and until when it counts as fresh; the panel ages it on its own clock */
+  t_wall?: number | null; fresh_until_wall?: number | null
 }
 export interface MonitorDde {
   enabled: boolean; synthetic: boolean; catalog_version: string; unsupported_adapter: string | null; scale: number
   signals: Record<string, MonitorDdeSignal>
-  regeneration: { state: 'active' | 'inactive' | 'unknown'; source: string | null }
+  regeneration: {
+    state: 'active' | 'inactive' | 'unknown'; source: string | null
+    measured_at_wall?: number | null; fresh_until_wall?: number | null; freshness_window_s?: number
+  }
+  /** every *_share is a share of WALL-CLOCK time in the last adaptation window; busy_time_share is DDE / link busy time */
+  scheduling?: {
+    target_share: number; allowed_share: number; projected_share: number; measured_share: number
+    busy_time_share?: number; window_s?: number; transaction_s: number | null; target_exceeded: boolean
+  }
 }
 /** DDE-06: manufacturer section of a monitoring summary. */
 export interface DdeRegeneration {
   type: string; origin: string; status: string; source: string; t_start_rel_s: number | null; t_end_rel_s: number | null
-  duration_s: number; samples: number; ended: string; synthetic: boolean; text: string; ended_between_rel_s?: (number | null)[]
+  duration_s: number; samples: number; started?: string; ended: string; synthetic: boolean; text: string
+  /** null lower bound: start not bounded (e.g. active before an unknown gap) */
+  started_between_rel_s?: (number | null)[]; ended_between_rel_s?: (number | null)[]
 }
 export interface DdeMonitoringSummary {
   status: string; reason?: string | null; synthetic?: boolean; catalog_version?: string | null; opted_in?: boolean | null

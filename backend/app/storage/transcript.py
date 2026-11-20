@@ -22,7 +22,7 @@ from app.obd.client import (
     interpret_pid,
 )
 from app.parameters.standard_pids import BITMAP_PIDS
-from app.storage.db import Store
+from app.storage.db import Store, chronological
 
 FORMAT = "mini-obd-transcript/1"
 RECORDING_META_KEYS = (
@@ -191,8 +191,10 @@ def ingest_transcript(
         meta=meta,
     )
     store.add_exchanges(sid, exchanges)
-    store.add_samples(sid, samples)
-    store.add_samples(sid, mfr_readings)
+    # one chronological timeline: generic OBD, adapter (ATRV) and manufacturer readings interleaved as
+    # recorded (they come from different record types in the transcript). Generic-only transcripts are
+    # inserted exactly as before (already in exchange order).
+    store.add_samples(sid, chronological([*samples, *mfr_readings]) if mfr_readings else samples)
     for scan in scans.values():
         store.add_scan(sid, scan)
     for a in annotations:

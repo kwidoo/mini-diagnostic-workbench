@@ -44,14 +44,15 @@ class DdeRuntime:
 
     @property
     def unsupported(self) -> str | None:
+        """Refusal remembered on the CLIENT (one adapter connection), so every runtime on that
+        connection - scans, inventory, recordings - respects it; a new connection starts clean."""
         return self._unsupported or getattr(self.client, "dde_unsupported", None)
 
     def _mark_unsupported(self, why: str | None) -> None:
         self._unsupported = why or "adapter cannot provide the documented addressing"
-        try:
-            self.client.dde_unsupported = self._unsupported
-        except AttributeError:
-            pass
+        mark = getattr(self.client, "mark_dde_unsupported", None)
+        if mark is not None:
+            mark(self._unsupported)
 
     # -- planning -------------------------------------------------------------------------
     def executable(self, kind: str | None = None) -> list[CatalogEntry]:

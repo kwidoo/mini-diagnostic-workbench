@@ -90,6 +90,19 @@ _SAMPLE_EXTRA = {
 }
 
 
+def chronological(readings: list[Reading]) -> list[Reading]:
+    """One timeline: order by monotonic time, then wall time; at identical timestamps generic /
+    adapter readings precede manufacturer readings, then the original order (stable, deterministic).
+    ``Store.samples()`` returns rows in insertion order, so writers that merge several sources
+    (transcript replay) insert through this."""
+    return [
+        r
+        for _, r in sorted(
+            enumerate(readings), key=lambda ir: (ir[1].t_mono, ir[1].t_wall, ir[1].source is not None, ir[0])
+        )
+    ]
+
+
 def new_session_id(t_wall: float | None = None) -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime(t_wall or time.time())) + "-" + secrets.token_hex(2)
 

@@ -7,6 +7,7 @@ takes an arbitrary command.
 
 from __future__ import annotations
 
+import itertools
 import re
 import threading
 
@@ -50,6 +51,9 @@ INIT_SEQUENCE = ["ATE0", "ATL0", "ATS1", "ATH1", "ATAT1", "ATSP0"]
 INIT_REQUIRED = {"ATE0", "ATH1", "ATSP0"}
 _VOLTAGE = re.compile(r"\d{1,2}(\.\d{1,2})?\s?V", re.IGNORECASE)
 _PROBE_REPLY = re.compile(r"(^|\s)41\s?00(\s|[0-9A-F]|$)", re.IGNORECASE)
+
+
+_CONNECTION_IDS = itertools.count(1)
 
 
 class ObdError(Exception):
@@ -198,9 +202,13 @@ class ObdClient:
         self.probe_timeout_s = 15.0  # the 0100 bootstrap probe: protocol search can take seconds
         self.adapter = AdapterInfo()
         self.capabilities: Capabilities | None = None
-        self.dde_unsupported: str | None = (
-            None  # DDE-03: adapter proved unable to address the DDE (this connection)
-        )
+        # One adapter connection as opened by the user (Workbench.connect / attach creates a new client).
+        # Internal TCP resyncs / re-initialisations inside it keep this id: it is the same adapter.
+        self.connection_id = next(_CONNECTION_IDS)
+        # DDE-03: set once this adapter refused the documented manufacturer addressing ('?' to a set-up
+        # command). Kept for the whole connection - also across internal reconnects, which a refused
+        # restore itself triggers - so the refused set-up is never re-sent; a new connection starts clean.
+        self._dde_unsupported: dict[str, object] | None = None
         self.family = "unsupported"
         self._gen: int | None = None
         self._initialised_once = False  # a failed re-init is retried on the next query
@@ -393,6 +401,23 @@ class ObdClient:
             and self._gen is not None
             and t.generation == self._gen
         )
+
+    @property
+    def dde_unsupported(self) -> str | None:
+        st = self._dde_unsupported
+        return str(st["reason"]) if st and st["connection_id"] == self.connection_id else None
+
+    def mark_dde_unsupported(self, reason: str) -> None:
+        if self._dde_unsupported is None:
+            self._dde_unsupported = {
+                "reason": reason,
+                "connection_id": self.connection_id,
+                "transport_generation": self.transport.generation,
+                "t_wall": self.transport.clock.wall(),
+            }
+
+    def dde_adapter_state(self) -> dict[str, object] | None:
+        return dict(self._dde_unsupported) if self._dde_unsupported else None
 
     def manufacturer_exchange(self, approved, timeout_s: float | None = None) -> list[Exchange] | None:
         """DDE-03: send one ApprovedRequest transaction (set-up, request, restore) on the CURRENT,

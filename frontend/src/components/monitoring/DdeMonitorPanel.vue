@@ -1,15 +1,44 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useWorkbench } from '../../stores/workbench'
-import type { DdeMonitoringSummary, MonitorDde } from '../../types'
+import type { DdeMonitoringSummary, MonitorDde, MonitorDdeSignal } from '../../types'
 
-/** live: the running recording's DDE state; summary: a stored session's DDE section. */
-const props = defineProps<{ live?: MonitorDde | null; summary?: DdeMonitoringSummary | null; inferredRegenerations?: number }>()
+/** live: the running recording's DDE state (+ the link state); summary: a stored session's DDE section.
+ *  Live freshness is re-evaluated on the panel's own clock: a measurement expires at its deadline even
+ *  when no new monitoring event arrives (e.g. after the ECU went silent). Summaries are not affected. */
+const props = defineProps<{
+  live?: MonitorDde | null; linkState?: string | null; summary?: DdeMonitoringSummary | null; inferredRegenerations?: number
+}>()
 const wb = useWorkbench()
+const nowS = ref(Date.now() / 1000)
+let timer: ReturnType<typeof setInterval> | undefined
+onMounted(() => {
+  if (props.live !== undefined) timer = setInterval(() => (nowS.value = Date.now() / 1000), 1000)
+})
+onUnmounted(() => clearInterval(timer))
+const linkOk = computed(() => !props.linkState || props.linkState === 'running')
+function sigAge(s: MonitorDdeSignal): number | null {
+  if (s.t_wall === undefined || s.t_wall === null) return s.age_s
+  return Math.max(0, Math.round((nowS.value - s.t_wall) * 10) / 10)
+}
+function sigStale(s: MonitorDdeSignal): boolean {
+  if (!linkOk.value) return true
+  if (s.fresh_until_wall === undefined || s.fresh_until_wall === null) return s.stale
+  return nowS.value > s.fresh_until_wall
+}
+const regenState = computed(() => {
+  const r = props.live?.regeneration
+  if (!r || !linkOk.value) return 'unknown'
+  if (r.fresh_until_wall === undefined) return r.state // older backend: server-side state only
+  if (r.fresh_until_wall === null || nowS.value > r.fresh_until_wall) return 'unknown'
+  return r.state
+})
+/** shares are fractions (0..1); scheduling shares are of wall-clock time, busy_time_share of link busy time */
+const pct = (x: number) => Math.round(x * 100)
 const t = (x: number | null | undefined) => (x === null || x === undefined ? 'n/a' : `${Math.round(x)} s`)
 const fmt = (v: number | null, unit: string | null) => (v === null ? '-' : `${Math.round(v * 100) / 100} ${unit ?? ''}`.trim())
 const regenText = computed(() => {
-  const s = props.live?.regeneration.state
+  const s = regenState.value
   if (s === 'active') return 'ACTIVE (confirmed by DDE)'
   if (s === 'inactive') return 'not active (confirmed by DDE)'
   return 'unknown (no fresh DDE flag)'
@@ -42,14 +71,23 @@ const offReason = computed(() => {
           <tbody>
             <tr v-for="(s, key) in live.signals" :key="key" :data-test="`dde-sig-${key}`">
               <td>{{ s.title ?? key }}</td>
-              <td>{{ s.quality === 'ok' ? fmt(s.value, s.unit) : 'not measured' }}</td>
-              <td><span class="badge" :class="s.quality === 'ok' ? '' : 'text-warn'">{{ s.suspended ? 'suspended' : s.quality ?? 'waiting' }}</span></td>
-              <td :class="s.stale ? 'text-warn' : ''">{{ s.age_s === null ? '-' : `${s.age_s} s` }}{{ s.stale ? ' (stale)' : '' }}</td>
+              <td :class="sigStale(s) ? 'text-ink-2' : ''">
+                <template v-if="s.quality !== 'ok'">not measured</template>
+                <template v-else-if="sigStale(s)">last {{ fmt(s.value, s.unit) }} (not current)</template>
+                <template v-else>{{ fmt(s.value, s.unit) }}</template>
+              </td>
+              <td><span class="badge" :class="s.quality === 'ok' && !sigStale(s) ? '' : 'text-warn'">{{ s.suspended ? 'suspended' : s.quality ?? 'waiting' }}</span></td>
+              <td :class="sigStale(s) ? 'text-warn' : ''" data-test="dde-age">{{ sigAge(s) === null ? '-' : `${sigAge(s)} s` }}{{ sigStale(s) ? ' (stale)' : '' }}</td>
               <td class="text-ink-2">{{ s.interval_s }} s</td>
             </tr>
           </tbody>
         </table>
-        <p class="mt-1 text-xs text-ink-2">DDE polling share is bounded; intervals stretched ×{{ live.scale }} for this adapter. Catalog {{ live.catalog_version }}.</p>
+        <p class="mt-1 text-xs text-ink-2" data-test="dde-scheduling">
+          DDE intervals stretched ×{{ live.scale }} for this adapter<template v-if="live.scheduling">; target
+          {{ pct(live.scheduling.target_share) }} % of wall-clock link time, measured {{ pct(live.scheduling.measured_share) }} %<template v-if="live.scheduling.busy_time_share != null"> ({{ pct(live.scheduling.busy_time_share) }} % of busy link time)</template><template v-if="live.scheduling.target_exceeded"> (target exceeded: slow adapter)</template></template>.
+          Catalog {{ live.catalog_version }}.
+        </p>
+        <p v-if="!linkOk" class="text-xs text-warn" data-test="dde-link-paused">Vehicle polling paused ({{ linkState }}): values below are not current.</p>
       </template>
     </template>
 

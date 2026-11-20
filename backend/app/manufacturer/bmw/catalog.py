@@ -176,8 +176,9 @@ def validate_entry(e: CatalogEntry, sources: dict[str, Source]) -> list[str]:
             p.append(f"source {sid!r} is synthetic but the entry is not marked synthetic")
     if e.synthetic and any(s in sources and sources[s].kind != "synthetic" for s in e.source_ids):
         p.append("a synthetic entry must cite synthetic sources only")
+    payload_ok = e.payload_hex is not None and bool(_HEX.match(e.payload_hex))
     if e.payload_hex is not None:
-        if not _HEX.match(e.payload_hex):
+        if not payload_ok:
             p.append(f"payload {e.payload_hex!r} is not canonical upper-case hex")
         else:
             sid = int(e.payload_hex[:2], 16)
@@ -186,8 +187,13 @@ def validate_entry(e: CatalogEntry, sources: dict[str, Source]) -> list[str]:
     if e.service is not None:
         if e.service in FORBIDDEN_SERVICES or e.service not in READ_ONLY_SERVICES:
             p.append(f"service {e.service:02X} is not a read-only diagnostic service")
-        if e.service == 0x19 and e.payload_hex and len(e.payload_hex) >= 4:
-            if int(e.payload_hex[2:4], 16) not in UDS_19_READ_SUBFUNCTIONS:
+        if e.service == 0x19 and e.payload_hex is not None:
+            # the sub-function is parsed only from validated hex: a malformed payload is a problem, never a crash
+            if not payload_ok:
+                p.append("UDS 19 sub-function cannot be checked: payload is not valid hex")
+            elif len(e.payload_hex) < 4:
+                p.append("UDS 19 request is truncated: no sub-function")
+            elif int(e.payload_hex[2:4], 16) not in UDS_19_READ_SUBFUNCTIONS:
                 p.append(f"UDS 19 sub-function {e.payload_hex[2:4]} is not a read-only sub-function")
     a = e.addressing
     if a is not None:
@@ -212,7 +218,7 @@ def validate_entry(e: CatalogEntry, sources: dict[str, Source]) -> list[str]:
             p.append(f"positive response SID {r.positive_sid:02X} does not match service {e.service:02X}")
         if r.echo_hex and not _HEX.match(r.echo_hex):
             p.append("response.echo_hex is not hex")
-        if e.payload_hex and r.echo_hex and not e.payload_hex[2:].startswith(r.echo_hex):
+        if payload_ok and r.echo_hex and not e.payload_hex[2:].startswith(r.echo_hex):  # type: ignore[index]
             p.append("response.echo_hex must repeat the request bytes after the service")
         if r.min_length < 1 or r.max_length < r.min_length:
             p.append("response length bounds are inconsistent")

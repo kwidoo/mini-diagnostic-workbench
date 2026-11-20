@@ -1301,7 +1301,7 @@ def monitoring_summary(
     air["history"] = compare_to_cohort(sd.id, refs.get("air_path_rows") or [])
     from app.diagnostics.dde import dde_summary
 
-    dde = dde_summary(sd.session, sd.samples, clk.t0)
+    dde = dde_summary(sd.session, sd.samples, clk.t0, sd.annotations)
     confirmed = (dde.get("regeneration") or {}).get("confirmed") or []
     detected = [*confirmed, *regens, *interrupted, *cool["detected"], *air["detected_events"]]
     return {

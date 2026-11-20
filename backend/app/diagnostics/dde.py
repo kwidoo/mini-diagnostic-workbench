@@ -57,57 +57,153 @@ def _stats(xs: list[float]) -> dict[str, Any] | None:
     }
 
 
-def regeneration_episodes(
-    rows: list[dict[str, Any]], interval_s: float, t0_wall: float | None
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """-> (confirmed episodes, unknown gaps). Only decoded 'ok' flag samples count; a failed or
-    stale read ends knowledge (unknown), it never says 'inactive'."""
-    # judge freshness against how often the flag was ACTUALLY read (the scheduler stretches DDE
-    # intervals on a slow link), never against an optimistic planned interval
-    ok_t = [r["t_wall"] for r in rows if r["quality"] in GOOD and r.get("status_json")]
-    spacing = (
-        statistics.median([b - a for a, b in zip(ok_t, ok_t[1:], strict=False)])
-        if len(ok_t) > 2
-        else interval_s
+LINK_GAP_EVENTS = {
+    "ecu_communication_lost": "ecu_communication_restored",
+    "adapter_connection_lost": "adapter_connection_restored",
+}
+
+
+def link_gaps(annotations: list[Any] | None) -> list[tuple[float, float | None, str]]:
+    """(lost_wall, restored_wall or None, event type) for ECU-silence / adapter-loss periods."""
+    out: list[tuple[float, float | None, str]] = []
+    open_: dict[str, float] = {}
+    for a in sorted(annotations or [], key=lambda a: a.t_wall):
+        et = a.event_type
+        if et in LINK_GAP_EVENTS:
+            open_.setdefault(et, a.t_wall)
+        for lost, restored in LINK_GAP_EVENTS.items():
+            if et == restored and lost in open_:
+                out.append((open_.pop(lost), a.t_wall, lost))
+    out += [(t, None, et) for et, t in open_.items()]
+    return out
+
+
+def freshness_window(attempt_times: list[float], planned_interval_s: float) -> tuple[float, float]:
+    """-> (cadence_s, window_s). The cadence is the median spacing of ATTEMPTED reads (every quality:
+    the scheduler's effective interval), never of successful reads only - so failed reads cannot make
+    the cadence look slower and stretch what counts as fresh."""
+    times = sorted(attempt_times)
+    cadence = (
+        statistics.median([b - a for a, b in zip(times, times[1:], strict=False)])
+        if len(times) > 2
+        else planned_interval_s
     )
-    stale = max(REGEN_STALE_FACTOR * max(interval_s, spacing), REGEN_STALE_MIN_S)
+    return cadence, max(REGEN_STALE_FACTOR * cadence, REGEN_STALE_MIN_S)
+
+
+def regeneration_episodes(
+    rows: list[dict[str, Any]],
+    interval_s: float,
+    t0_wall: float | None,
+    annotations: list[Any] | None = None,
+    session_end_wall: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """-> (confirmed episodes, unknown gaps).
+
+    Each decoded ('ok') flag reading confirms the state at its own instant. The state between two
+    consecutive ok readings is known only when they are at most one freshness window apart (window
+    from the ATTEMPTED-read cadence) AND no ECU-silence / adapter-loss period lies between them.
+    Otherwise that span is an unknown gap: never 'inactive', never part of a confirmed duration. A
+    confirmed episode is the span from its first to its last active reading inside one known run;
+    starts / ends between readings are reported as bounds, not guessed. A run that is active again
+    after an unknown gap that followed an ACTIVE reading has no known start lower bound (None): the
+    regeneration may have continued through the gap."""
+    attempts = sorted(rows, key=lambda r: (r["t_mono"], r["t_wall"]))
+    cadence, window = freshness_window([r["t_mono"] for r in attempts], interval_s)
+    link = link_gaps(annotations)
     episodes: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
-    last_ok: dict[str, Any] | None = None
+    prev: dict[str, Any] | None = None  # previous ok reading: {"active", "t_wall", "t_mono"}
 
-    def rel(t: float) -> float | None:
-        return round(t - t0_wall, 2) if t0_wall is not None else None
+    def rel(t: float | None) -> float | None:
+        return round(t - t0_wall, 2) if t is not None and t0_wall is not None else None
 
-    def close(end_t: float, how: str) -> None:
+    def between(a_mono: float, b_mono: float | None) -> list[dict[str, Any]]:
+        hi = b_mono if b_mono is not None else float("inf")
+        return [r for r in attempts if a_mono < r["t_mono"] < hi]
+
+    def why_unknown(a: dict[str, Any], b_wall: float | None, b_mono: float | None) -> str | None:
+        """Why the span after ok reading ``a`` up to b is NOT known (None: it is known)."""
+        hi = b_wall if b_wall is not None else float("inf")
+        hits = [et for lost, back, et in link if lost <= hi and (back is None or back >= a["t_wall"])]
+        if "ecu_communication_lost" in hits:
+            return "ECU communication lost"
+        if hits:
+            return "adapter connection lost"
+        if b_mono is None or b_mono - a["t_mono"] > window:
+            failed = sum(1 for r in between(a["t_mono"], b_mono) if r["quality"] not in GOOD)
+            if failed:
+                return f"{failed} failed / unusable read(s), no fresh reading"
+            return "no read attempt (polling suspended, paused or stopped)"
+        return None
+
+    def gap(a: dict[str, Any], b_wall: float | None, b_mono: float | None, reason: str) -> None:
+        gaps.append(
+            {
+                "from_rel_s": rel(a["t_wall"]),
+                "to_rel_s": rel(b_wall),
+                "gap_s": round(b_wall - a["t_wall"], 2) if b_wall is not None else None,
+                "failed_reads": sum(1 for r in between(a["t_mono"], b_mono) if r["quality"] not in GOOD),
+                "reason": reason,
+                "state_before": "active" if a["active"] else "inactive",
+            }
+        )
+
+    def close(ended: str, end_bounds: list[float | None]) -> None:
         nonlocal cur
-        if cur is not None:
-            cur["t_end_wall"], cur["t_end_rel_s"], cur["ended"] = end_t, rel(end_t), how
-            cur["duration_s"] = round(end_t - cur["t_start_wall"], 2)
-            episodes.append(cur)
-            cur = None
+        assert cur is not None
+        cur["t_end_wall"] = cur["last_confirmed_wall"]
+        cur["t_end_rel_s"] = rel(cur["last_confirmed_wall"])
+        cur["duration_s"] = round(cur["last_confirmed_wall"] - cur["t_start_wall"], 2)  # measured span only
+        cur["ended"] = ended
+        cur["ended_between_rel_s"] = [rel(x) for x in end_bounds]
+        episodes.append(cur)
+        cur = None
 
-    for r in rows:
+    for r in attempts:
         if r["quality"] not in GOOD or not r.get("status_json"):
             continue
         active = bool(json.loads(r["status_json"]).get("active"))
-        t = r["t_wall"]
-        if last_ok is not None and t - last_ok["t_wall"] > stale:
-            gaps.append({"from_rel_s": rel(last_ok["t_wall"]), "to_rel_s": rel(t),
-                         "gap_s": round(t - last_ok["t_wall"], 2)})  # fmt: skip
-            # the state during the gap is unknown: an open episode ends at its last confirmation
-            close(last_ok["t_wall"], "unknown (data gap)")
+        reason = why_unknown(prev, r["t_wall"], r["t_mono"]) if prev is not None else None
+        if prev is not None and reason:
+            gap(prev, r["t_wall"], r["t_mono"], reason)
+            if cur is not None:
+                close(f"unknown ({reason})", [cur["last_confirmed_wall"], None])
         if active and cur is None:
+            if prev is None:
+                started, bounds = (
+                    "active at the first decoded reading (start not observed)",
+                    [None, r["t_wall"]],
+                )
+            elif reason and prev["active"]:
+                # active on both sides of the gap: it may have run straight through, so the previous
+                # active reading is NOT a lower bound on when this regeneration started
+                started = (
+                    "active at the first fresh reading after an unknown gap; also active before the gap, so it "
+                    "may have continued through it (start not observed, no known lower bound)"
+                )
+                bounds = [None, r["t_wall"]]
+            elif reason:
+                started = "active at the first fresh reading after an unknown gap (start not observed)"
+                bounds = [prev["t_wall"], r["t_wall"]]  # inactive before the gap: it started after that
+            else:
+                started, bounds = (
+                    "flag became active between two fresh readings",
+                    [prev["t_wall"], r["t_wall"]],
+                )
             cur = {
                 "type": "regeneration",
                 "origin": "measured",
                 "status": "confirmed",
                 "confidence": "measured",
                 "source": "bmw_dde",
-                "t_wall": t,
-                "t_rel_s": rel(t),
-                "t_start_wall": t,
-                "t_start_rel_s": rel(t),
+                "t_wall": r["t_wall"],
+                "t_rel_s": rel(r["t_wall"]),
+                "t_start_wall": r["t_wall"],
+                "t_start_rel_s": rel(r["t_wall"]),
+                "started": started,
+                "started_between_rel_s": [rel(x) for x in bounds],
                 "samples": 0,
                 "decoder_version": r.get("decoder_version"),
                 "catalog_version": r.get("catalog_version"),
@@ -115,15 +211,25 @@ def regeneration_episodes(
             }
         if active and cur is not None:
             cur["samples"] += 1
-            cur["last_confirmed_wall"] = t
+            cur["last_confirmed_wall"] = r["t_wall"]
         if not active and cur is not None:
-            # the flag changed somewhere between the last active and this inactive reading: the
-            # confirmed span ends at the last active reading; the bound is kept, not guessed
-            cur["ended_between_rel_s"] = [rel(cur["last_confirmed_wall"]), rel(t)]
-            close(cur["last_confirmed_wall"], "flag inactive")
-        last_ok = r
-    if cur is not None:
-        close(cur["last_confirmed_wall"], "still active at the last fresh reading")
+            close("flag inactive between two fresh readings", [cur["last_confirmed_wall"], r["t_wall"]])
+        prev = {"active": active, "t_wall": r["t_wall"], "t_mono": r["t_mono"]}
+    if prev is not None:
+        last_attempt = attempts[-1]
+        end_wall = max(session_end_wall or last_attempt["t_wall"], last_attempt["t_wall"])
+        end_mono = prev["t_mono"] + (end_wall - prev["t_wall"])
+        reason = why_unknown(prev, end_wall, end_mono)
+        if reason and end_wall > prev["t_wall"]:
+            gap(prev, end_wall, end_mono, reason)
+        if cur is not None:
+            close(
+                f"unknown after the last fresh reading ({reason})" if reason else "still active at the end",
+                [cur["last_confirmed_wall"], None],
+            )
+    for e in episodes:
+        e["freshness_window_s"] = round(window, 2)
+        e["read_cadence_s"] = round(cadence, 2)
     return episodes, gaps
 
 
@@ -149,7 +255,10 @@ def _pair(cmd: list[dict[str, Any]], act: list[dict[str, Any]]) -> dict[str, Any
 
 
 def dde_summary(
-    session: dict[str, Any], samples: list[dict[str, Any]], t0_wall: float | None
+    session: dict[str, Any],
+    samples: list[dict[str, Any]],
+    t0_wall: float | None,
+    annotations: list[Any] | None = None,
 ) -> dict[str, Any]:
     meta = session.get("meta") or {}
     plan_meta = meta.get("dde")
@@ -192,20 +301,19 @@ def dde_summary(
     episodes, gaps = ([], [])
     if regen_key:
         episodes, gaps = regeneration_episodes(
-            by.get(regen_key, []), float(plan[regen_key].get("base_interval_s") or 5.0), t0_wall
+            by.get(regen_key, []),
+            float(plan[regen_key].get("base_interval_s") or 5.0),
+            t0_wall,
+            annotations,
+            session.get("ended_at"),
         )
     for e in episodes:
         e["synthetic"] = synthetic
         e["text"] = (
             ("SYNTHETIC: " if synthetic else "")
-            + f"DPF regeneration confirmed by the DDE regeneration flag for {e['duration_s']:.0f} s "
-            f"({e['samples']} reading(s), span between the first and last active reading); ended: {e['ended']}"
-            + (
-                f" between {e['ended_between_rel_s'][0]} s and {e['ended_between_rel_s'][1]} s"
-                if e.get("ended_between_rel_s")
-                else ""
-            )
-            + "."
+            + f"DPF regeneration confirmed by the DDE regeneration flag over a measured span of {e['duration_s']:.0f} s "
+            f"({e['samples']} active reading(s), first to last; unknown gaps are never included). "
+            f"Start: {e['started']}; end: {e['ended']}."
         )
     pairs = {name: _pair(by.get(c, []), by.get(a, [])) for name, c, a in PAIRS if c in by or a in by}
     limitations = [
