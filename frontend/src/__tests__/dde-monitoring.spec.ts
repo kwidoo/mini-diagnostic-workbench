@@ -101,3 +101,41 @@ describe('live DDE freshness without new events (review fix 4)', () => {
     expect(w.get('[data-test=regen-confirmed]').text()).toContain('confirmed by DDE')
   })
 })
+
+describe('DDE scheduling shares and regeneration start bounds (PR #10 P2 follow-up)', () => {
+  beforeEach(() => setActivePinia(createPinia()))
+
+  it('labels the measured share as wall-clock link time and the busy-time share separately', () => {
+    const scheduling = {
+      target_share: 0.35, allowed_share: 0.35, projected_share: 0.1, measured_share: 0.1,
+      busy_time_share: 0.857, window_s: 30, transaction_s: 1, target_exceeded: false,
+    }
+    const text = mount(DdeMonitorPanel, { props: { live: { ...live, scheduling } } }).get('[data-test=dde-scheduling]').text()
+    expect(text).toContain('target 35 % of wall-clock link time')
+    expect(text).toContain('measured 10 %') // same basis as the target, never the busy-time share
+    expect(text).toContain('(86 % of busy link time)')
+    expect(text).not.toContain('measured 86 %')
+    expect(text).not.toContain('target exceeded')
+  })
+
+  it('older snapshots without busy_time_share show no busy-time figure', () => {
+    const scheduling = { target_share: 0.35, allowed_share: 0.2, projected_share: 0.4, measured_share: 0.38, transaction_s: 1.2, target_exceeded: true }
+    const text = mount(DdeMonitorPanel, { props: { live: { ...live, scheduling } } }).get('[data-test=dde-scheduling]').text()
+    expect(text).toContain('measured 38 %')
+    expect(text).not.toContain('busy link time')
+    expect(text).toContain('target exceeded: slow adapter')
+  })
+
+  it('a regeneration active before an unknown gap is shown without a claimed start', () => {
+    const resumed = {
+      ...summary.regeneration!.confirmed[0], t_start_rel_s: 100, duration_s: 0, samples: 1,
+      started: 'active at the first fresh reading after an unknown gap; also active before the gap, so it may have continued through it (start not observed, no known lower bound)',
+      started_between_rel_s: [null, 100],
+      text: 'SYNTHETIC: DPF regeneration confirmed by the DDE regeneration flag over a measured span of 0 s (1 active reading(s), first to last; unknown gaps are never included). Start: active at the first fresh reading after an unknown gap; also active before the gap, so it may have continued through it (start not observed, no known lower bound); end: still active at the end.',
+    }
+    const s: DdeMonitoringSummary = { ...summary, regeneration: { ...summary.regeneration!, confirmed: [resumed] } }
+    const row = mount(DdeMonitorPanel, { props: { summary: s } }).get('[data-test=regen-confirmed]').text()
+    expect(row).toContain('may have continued through it')
+    expect(row).toContain('no known lower bound')
+  })
+})

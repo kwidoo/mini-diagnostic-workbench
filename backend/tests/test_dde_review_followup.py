@@ -142,6 +142,29 @@ def test_ok_flags_far_apart_with_failed_reads_between_are_not_a_continuous_regen
     assert len([g for g in gaps if "failed" in g["reason"]]) == 2
     assert eps[0]["freshness_window_s"] == 15.0 and eps[0]["read_cadence_s"] == 5.0
     assert eps[1]["started"].startswith("active at the first fresh reading after an unknown gap")
+    assert eps[1]["started_between_rel_s"] == [None, 100.0]
+    assert eps[2]["started_between_rel_s"] == [None, 200.0]
+
+
+def test_active_before_and_after_an_unknown_gap_has_no_start_lower_bound():
+    # Codex P2 on PR #10: active at 0 and 5 s, failed reads through 95 s, active again at 100 s
+    rows = [_row(0), _row(5), _row(100)] + [_row(t, "no_data") for t in range(10, 100, 5)]
+    eps, gaps = regeneration_episodes(rows, 5.0, T0, session_end_wall=T0 + 100)
+    assert [e["duration_s"] for e in eps] == [5, 0]  # confirmed spans stay separate; the gap is not counted
+    assert eps[0]["started_between_rel_s"] == [None, 0.0]
+    assert eps[0]["ended"].startswith("unknown") and eps[0]["ended_between_rel_s"] == [5.0, None]
+    assert eps[1]["started_between_rel_s"] == [None, 100.0]  # NOT [5, 100]: a start before 5 s is possible
+    assert "may have continued through it" in eps[1]["started"]
+    assert len(gaps) == 1 and gaps[0]["state_before"] == "active" and gaps[0]["failed_reads"] == 18
+
+
+def test_inactive_before_an_unknown_gap_keeps_the_start_lower_bound():
+    rows = [_row(0, active=False), _row(5, active=False), _row(100)]
+    rows += [_row(t, "no_data") for t in range(10, 100, 5)]
+    eps, gaps = regeneration_episodes(rows, 5.0, T0, session_end_wall=T0 + 100)
+    (e,) = eps
+    assert e["started_between_rel_s"] == [5.0, 100.0]  # it was inactive at 5 s, so it started after that
+    assert "may have continued" not in e["started"] and gaps[0]["state_before"] == "inactive"
 
 
 def test_intermittent_failures_shorter_than_the_freshness_window_keep_the_run():
@@ -161,7 +184,8 @@ def test_adapter_loss_during_regeneration_splits_it_and_resumes_after_the_gap():
     assert [e["duration_s"] for e in eps] == [50, 25]  # the 75 s outage is never counted
     assert eps[0]["ended"] == "unknown (adapter connection lost)" and eps[0]["ended_between_rel_s"][1] is None
     assert eps[1]["started"].startswith("active at the first fresh reading after an unknown gap")
-    assert eps[1]["started_between_rel_s"] == [50.0, 125.0]
+    # active on both sides of the outage: the regeneration may have continued, no start lower bound
+    assert eps[1]["started_between_rel_s"] == [None, 125.0]
     assert gaps[0]["reason"] == "adapter connection lost" and gaps[0]["state_before"] == "active"
 
 
@@ -201,6 +225,9 @@ def test_live_events_and_session_analysis_use_the_same_semantics(store):
         "dde_regeneration_confirmed",
         "dde_regeneration_ended",
     ]
+    (confirmed,) = events(store, sid, "dde_regeneration_confirmed")
+    assert confirmed.evidence["state_before_unknown_period"] == "active"
+    assert "may have continued through it" in confirmed.note
     m = summary_for(store, sid)
     eps = m["dde"]["regeneration"]["confirmed"]
     assert len(eps) == 2  # one per started / re-confirmed event
@@ -208,6 +235,7 @@ def test_live_events_and_session_analysis_use_the_same_semantics(store):
         eps[0]["ended"].startswith("unknown")
         and eps[1]["ended"] == "flag inactive between two fresh readings"
     )
+    assert eps[1]["started_between_rel_s"][0] is None  # active before the flag gap: no start lower bound
     total = sum(e["duration_s"] for e in eps)
     assert total < 300 - 90  # the ~100 s without a fresh flag is not counted
 
@@ -241,12 +269,81 @@ def test_dde_never_degrades_the_generic_fast_tier(tmp_path, delay):
     assert off["dde"] is None and not any("dde_scale" in a for a in off["adjustments"])
     sched = on["dde"]["scheduling"]
     assert sched["target_share"] == 0.35 and "projected_share" in sched and "measured_share" in sched
+    # wall-clock share can never exceed the busy-time share (busy time <= window)
+    assert sched["measured_share"] <= sched["busy_time_share"]
+    assert sched["window_s"] >= monitor_mod.ADAPT_EVERY_S
     assert on["dde"]["final_effective_intervals"] and all(
         v > 0 for v in on["dde"]["final_effective_intervals"].values()
     )
     if delay:
         assert on["dde"]["final_scale"] > 1.0
         assert any("dde_effective_intervals" in a for a in on["adjustments"])
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def wall(self):
+        return T0 + self.t
+
+
+class _DueDde:
+    def due(self, metric):
+        return True
+
+
+def _recorder_for_adapt():
+    from types import SimpleNamespace
+
+    from app.vehicles.profiles import SamplingTiers
+
+    clock = _Clock()
+    rec = monitor_mod.MonitoringRecorder(
+        SimpleNamespace(transport=SimpleNamespace(clock=clock)),
+        {"fast": [0x0C]},
+        SamplingTiers(),
+        False,
+        None,
+        lambda r: None,
+        lambda a: None,
+        dde_live=_DueDde(),
+        dde_plan=[{"metric": "dde_x", "tier": "slow", "base_interval_s": 10.0}],
+    )
+    return rec, clock
+
+
+def test_all_scheduling_shares_are_wall_clock_shares_and_busy_share_is_separate():
+    # Codex P2 on PR #10: measured_share was DDE / BUSY time while target / allowed / projected are
+    # shares of wall-clock time. One 30 s window: 103 requests in 10 s of link busy time, 3 of them DDE
+    # transactions of 1 s each = exactly the projected DDE rate (1 read / 10 s x 1 s per transaction).
+    rec, clock = _recorder_for_adapt()
+    clock.t = 30.0
+    rec._busy, rec._count, rec._dde_busy, rec._dde_count = 10.0, 103, 3.0, 3
+    rec._adapt()
+    st = rec._dde_status
+    assert st["window_s"] == 30.0
+    assert st["projected_share"] == pytest.approx(0.1)
+    assert st["measured_share"] == pytest.approx(0.1)  # 3 s of DDE per 30 s wall clock (was 0.3)
+    assert st["busy_time_share"] == pytest.approx(0.3)  # 3 s of DDE per 10 s of busy link time
+    assert st["measured_share"] <= st["allowed_share"] <= st["target_share"] == 0.35
+    assert not st["target_exceeded"] and rec.dde_scale == 1.0
+
+
+def test_measured_share_does_not_inflate_when_the_link_is_mostly_idle():
+    # the same 3 s of DDE work, but the link was busy for only 3.5 s of a 30 s window: under the old
+    # busy-time semantics DDE looked like 86 % of "link time" against a 35 % target
+    rec, clock = _recorder_for_adapt()
+    clock.t = 30.0
+    rec._busy, rec._count, rec._dde_busy, rec._dde_count = 3.5, 53, 3.0, 3
+    rec._adapt()
+    st = rec._dde_status
+    assert st["measured_share"] == pytest.approx(0.1)
+    assert st["busy_time_share"] == pytest.approx(0.857, abs=1e-3)
+    assert st["measured_share"] < st["target_share"]
 
 
 def test_heavy_dde_workload_is_recorded_as_target_exceeded_not_hidden(tmp_path, monkeypatch):

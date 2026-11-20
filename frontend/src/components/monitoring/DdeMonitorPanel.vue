@@ -33,6 +33,8 @@ const regenState = computed(() => {
   if (r.fresh_until_wall === null || nowS.value > r.fresh_until_wall) return 'unknown'
   return r.state
 })
+/** shares are fractions (0..1); scheduling shares are of wall-clock time, busy_time_share of link busy time */
+const pct = (x: number) => Math.round(x * 100)
 const t = (x: number | null | undefined) => (x === null || x === undefined ? 'n/a' : `${Math.round(x)} s`)
 const fmt = (v: number | null, unit: string | null) => (v === null ? '-' : `${Math.round(v * 100) / 100} ${unit ?? ''}`.trim())
 const regenText = computed(() => {
@@ -82,7 +84,7 @@ const offReason = computed(() => {
         </table>
         <p class="mt-1 text-xs text-ink-2" data-test="dde-scheduling">
           DDE intervals stretched ×{{ live.scale }} for this adapter<template v-if="live.scheduling">; target
-          {{ Math.round(live.scheduling.target_share * 100) }} % of link time, now {{ Math.round(live.scheduling.measured_share * 100) }} %<template v-if="live.scheduling.target_exceeded"> (target exceeded: slow adapter)</template></template>.
+          {{ pct(live.scheduling.target_share) }} % of wall-clock link time, measured {{ pct(live.scheduling.measured_share) }} %<template v-if="live.scheduling.busy_time_share != null"> ({{ pct(live.scheduling.busy_time_share) }} % of busy link time)</template><template v-if="live.scheduling.target_exceeded"> (target exceeded: slow adapter)</template></template>.
           Catalog {{ live.catalog_version }}.
         </p>
         <p v-if="!linkOk" class="text-xs text-warn" data-test="dde-link-paused">Vehicle polling paused ({{ linkState }}): values below are not current.</p>

@@ -105,7 +105,9 @@ def regeneration_episodes(
     from the ATTEMPTED-read cadence) AND no ECU-silence / adapter-loss period lies between them.
     Otherwise that span is an unknown gap: never 'inactive', never part of a confirmed duration. A
     confirmed episode is the span from its first to its last active reading inside one known run;
-    starts / ends between readings are reported as bounds, not guessed."""
+    starts / ends between readings are reported as bounds, not guessed. A run that is active again
+    after an unknown gap that followed an ACTIVE reading has no known start lower bound (None): the
+    regeneration may have continued through the gap."""
     attempts = sorted(rows, key=lambda r: (r["t_mono"], r["t_wall"]))
     cadence, window = freshness_window([r["t_mono"] for r in attempts], interval_s)
     link = link_gaps(annotations)
@@ -174,9 +176,17 @@ def regeneration_episodes(
                     "active at the first decoded reading (start not observed)",
                     [None, r["t_wall"]],
                 )
+            elif reason and prev["active"]:
+                # active on both sides of the gap: it may have run straight through, so the previous
+                # active reading is NOT a lower bound on when this regeneration started
+                started = (
+                    "active at the first fresh reading after an unknown gap; also active before the gap, so it "
+                    "may have continued through it (start not observed, no known lower bound)"
+                )
+                bounds = [None, r["t_wall"]]
             elif reason:
                 started = "active at the first fresh reading after an unknown gap (start not observed)"
-                bounds = [prev["t_wall"], r["t_wall"]]
+                bounds = [prev["t_wall"], r["t_wall"]]  # inactive before the gap: it started after that
             else:
                 started, bounds = (
                     "flag became active between two fresh readings",

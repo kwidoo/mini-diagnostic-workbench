@@ -70,7 +70,7 @@ MAX_LOW_TIER_STRETCH = 4.0  # medium/slow are stretched up to this factor before
 BACKOFF_S = (2.0, 60.0)  # adapter unreachable: retry back-off (initial, max)
 ADAPTER_LOST_FAILS = 2  # consecutive unanswered ATRV reads (vehicle polling paused) = adapter link lost
 MAX_ADJUSTMENTS_KEPT = 200
-DDE_TARGET_SHARE = 0.35  # aim: DDE transactions use at most this share of link time (a TARGET, see _adapt)
+DDE_TARGET_SHARE = 0.35  # aim: DDE uses at most this share of wall-clock link time (a TARGET, see _adapt)
 DDE_MAX_SCALE = 8.0  # DDE intervals are stretched up to this factor to meet it; beyond: recorded as exceeded
 
 
@@ -441,8 +441,16 @@ class MonitoringRecorder:
                     f"DPF regeneration flag ACTIVE as reported by the DDE (measured manufacturer value{tag}). "
                     + ("First decoded reading of this recording" if prev is None else "First fresh reading after an "
                        "unknown period")
+                    + (" (also active before it, so it may have continued through it)"
+                       if prev is not None and prev.get("active") else "")
                     + ": when it started is not known.",
-                    {**evidence, "after_unknown_period": prev is not None},
+                    {
+                        **evidence,
+                        "after_unknown_period": prev is not None,
+                        "state_before_unknown_period": (
+                            None if prev is None else ("active" if prev.get("active") else "inactive")
+                        ),
+                    },
                     at=(r.t_wall, r.t_mono),
                 )  # fmt: skip
             return
@@ -731,9 +739,10 @@ class MonitoringRecorder:
           makes the generic link look slower), and the generic tiers are scaled against the full load
           budget exactly as without DDE - DDE never stretches the generic fast tier.
         * DDE demand uses the measured time of one DDE transaction (set-up + request + restore) and the
-          EFFECTIVE DDE intervals. Its share of link time is aimed at DDE_TARGET_SHARE (or less, if the
-          generic tiers need more of the budget) by stretching DDE intervals, up to DDE_MAX_SCALE. If even
-          that is not enough the target is recorded as exceeded: it is a target, not a hard limit.
+          EFFECTIVE DDE intervals. Its share of wall-clock link time is aimed at DDE_TARGET_SHARE (or
+          less, if the generic tiers need more of the budget) by stretching DDE intervals, up to
+          DDE_MAX_SCALE. If even that is not enough the target is recorded as exceeded: it is a target,
+          not a hard limit.
         """
         now = self.clock.monotonic()
         if now - self._window_start < ADAPT_EVERY_S or self._count < 5 or self._busy <= 0:
@@ -745,7 +754,12 @@ class MonitoringRecorder:
         if self._dde_count:
             tx = self._dde_busy / self._dde_count
             self._dde_tx_s = tx if self._dde_tx_s is None else 0.5 * self._dde_tx_s + 0.5 * tx
-        measured_dde_share = self._dde_busy / self._busy
+        # every *_share in the scheduling status is a share of WALL-CLOCK time (busy link-seconds per
+        # second of the adaptation window), like target / allowed / projected; the DDE share of the
+        # link's busy time only is a different quantity and is reported as busy_time_share
+        window_s = now - self._window_start
+        measured_dde_share = self._dde_busy / window_s
+        dde_busy_time_share = self._dde_busy / self._busy
         self._window_start, self._busy, self._count = now, 0.0, 0
         self._dde_busy, self._dde_count = 0.0, 0
 
@@ -783,6 +797,8 @@ class MonitoringRecorder:
             "allowed_share": round(allowed, 3),
             "projected_share": round(projected, 3),
             "measured_share": round(measured_dde_share, 3),
+            "busy_time_share": round(dde_busy_time_share, 3),
+            "window_s": round(window_s, 2),
             "transaction_s": round(self._dde_tx_s, 3) if self._dde_tx_s else None,
             "target_exceeded": exceeded,
         }
@@ -801,7 +817,7 @@ class MonitoringRecorder:
             if self.dde is not None:
                 adj.update(
                     dde_scale=self.dde_scale,
-                    dde_share=round(measured_dde_share, 3),
+                    dde_share=round(measured_dde_share, 3),  # wall-clock, = dde.measured_share
                     dde=dict(self._dde_status),
                     dde_effective_intervals={
                         i.metric: round(self.interval(i), 3) for i in self.items if i.kind == "dde"

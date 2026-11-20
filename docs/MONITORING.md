@@ -332,7 +332,10 @@ is exercised with the simulator's invented DDE (`mini_dde_drive`, `mini_dde_synt
   more of the load budget**. 35 % is a target, not a hard limit: when x8 is not enough the
   adjustment records `dde.target_exceeded`. Each adjustment records generic capacity,
   measured / allowed / projected DDE share, transaction time and the effective DDE
-  intervals; the summary keeps `dde.scheduling` and `dde.final_effective_intervals`. Items
+  intervals. All four `*_share` values (`target_share`, `allowed_share`, `projected_share`,
+  `measured_share`) are shares of **wall-clock** time: DDE link-busy seconds per second of the
+  adaptation window (`window_s`). The DDE share of the link's *busy* time only is a different
+  quantity and is reported separately as `busy_time_share`; the summary keeps `dde.scheduling` and `dde.final_effective_intervals`. Items
   that are due are served generic first; DDE is deferred. After a reconnect or ECU restore,
   generic items are polled at once and DDE items are spread over their next interval, with
   no catch-up burst. A signal that keeps answering NO DATA / negative is backed off (DDE-05).
@@ -352,7 +355,11 @@ is exercised with the simulator's invented DDE (`mini_dde_drive`, `mini_dde_synt
   and never counted in a confirmed duration. A confirmed episode runs from its first to its
   last active reading within one known run. Start / end are reported as bounds
   (`started_between_rel_s`, `ended_between_rel_s`), with `started` / `ended` saying whether
-  a transition was observed or the knowledge ended (gap, ECU silence, adapter loss). The live
+  a transition was observed or the knowledge ended (gap, ECU silence, adapter loss). A bound
+  is `null` when it is not known: if the flag was active before an unknown gap and is active
+  again after it, the regeneration may have run straight through, so the resumed span has no
+  start lower bound (the reading before the gap is not one); if it was inactive before the
+  gap, that reading stays the lower bound. The live
   recorder applies the same rules: `dde_regeneration_started` / `_ended` only between two
   known states, `dde_regeneration_unknown` when an active state stops being fresh (stale, ECU
   silent, adapter lost), `dde_regeneration_confirmed` when the flag is active at the first
